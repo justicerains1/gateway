@@ -2859,7 +2859,8 @@ struct AgentBucketRow {
 #[derive(Debug, sqlx::FromRow)]
 struct RateBucketRow {
     bucket_epoch: i64,
-    deployment_id: Option<String>,
+    model_name: String,
+    deployment_id: String,
     total: i64,
 }
 
@@ -2907,7 +2908,7 @@ pub async fn get_request_rate_stats(
         let mut by_model: std::collections::BTreeMap<String, std::collections::HashMap<String, Vec<u64>>> =
             std::collections::BTreeMap::new();
 
-        for (dep_id, data) in all.into_iter() {
+        for (dep_id, model, data) in all.into_iter() {
             // Tracker has exactly 60 buckets aligned to (now - 59min) .. now,
             // which matches the 1h TimeWindow's expected_buckets ordering.
             let counts: Vec<u64> = data.into_iter().map(|(_, c)| c).collect();
@@ -2918,8 +2919,14 @@ pub async fn get_request_rate_stats(
             // Pad / truncate to expected length just in case.
             let mut v = counts;
             v.resize(expected_ts.len(), 0u64);
-            let model = state.deployment_store.find_model_by_deployment_id(&dep_id)
-                .unwrap_or_else(|| "-".to_string());
+            // Series are attributed by the model name recorded at request
+            // time (same value audit logs), NOT by reverse-looking-up the
+            // live store — a deleted/renamed deployment would otherwise show
+            // as "-" or flip between old/new names. All-zero series (traffic
+            // aged out of the 60-min window) are dropped entirely.
+            if v.iter().all(|&c| c == 0) {
+                continue;
+            }
             by_model.entry(model).or_default().insert(dep_id, v);
         }
 
@@ -2969,13 +2976,14 @@ pub async fn get_request_rate_stats(
         let rows = sqlx::query_as::<_, RateBucketRow>(
             r#"SELECT
                  (FLOOR((EXTRACT(EPOCH FROM created_at) - $1) / $2) * $2 + $1)::bigint AS bucket_epoch,
-                 deployment_id,
+                 COALESCE(model_name, '-') AS model_name,
+                 COALESCE(deployment_id, '_unknown') AS deployment_id,
                  COUNT(*)::bigint AS total
                FROM boom_request_log
                WHERE created_at >= $3 AND created_at < $4
                  AND status_code = 200
-               GROUP BY 1, 2
-               ORDER BY 2, 1"#,
+               GROUP BY 1, 2, 3
+               ORDER BY 2, 3, 1"#,
         )
         .bind(from_epoch)
         .bind(bucket_secs)
@@ -2999,17 +3007,17 @@ pub async fn get_request_rate_stats(
 
     // Group by model → deployment_id → bucket count. Deployments are ordered
     // alphabetically per model so stacked-bar segment positions are stable.
+    // Attribution uses the model_name logged at request time (immutable
+    // fact), NOT a reverse lookup against the live store — deleted/renamed
+    // models keep their historical series under the name they served under.
     let mut total_by_bucket: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
     // model -> (deployment_id -> (bucket_epoch -> count))
     let mut by_model: std::collections::BTreeMap<String, std::collections::HashMap<String, std::collections::HashMap<i64, i64>>> =
         std::collections::BTreeMap::new();
 
     for row in rows {
-        let dep = row.deployment_id.clone().unwrap_or_else(|| "_unknown".to_string());
-        let model = state.deployment_store.find_model_by_deployment_id(&dep)
-            .unwrap_or_else(|| "-".to_string());
-        by_model.entry(model).or_default()
-            .entry(dep).or_default()
+        by_model.entry(row.model_name).or_default()
+            .entry(row.deployment_id).or_default()
             .insert(row.bucket_epoch, row.total);
         *total_by_bucket.entry(row.bucket_epoch).or_insert(0) += row.total;
     }

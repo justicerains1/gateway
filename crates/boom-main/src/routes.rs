@@ -935,7 +935,7 @@ async fn chat_completions_inner(
         // Provider returned a stream — count as a successfully handled request.
         state.agent_stats.record(api_path);
         if let Some(ref did) = deployment_id {
-            state.request_rate.record(did);
+            state.request_rate.record(did, &inflight_model);
         }
 
         let api_path_owned = api_path.to_string();
@@ -1099,7 +1099,7 @@ async fn chat_completions_inner(
         // Provider returned a response — count as a successfully handled request.
         state.agent_stats.record(api_path);
         if let Some(ref did) = deployment_id {
-            state.request_rate.record(did);
+            state.request_rate.record(did, &inflight_model);
         }
 
         log_request(
@@ -3214,7 +3214,7 @@ pub async fn messages(
         // Provider returned a stream — count as a successfully handled request.
         state.agent_stats.record("/v1/messages");
         if let Some(ref did) = deployment_id {
-            state.request_rate.record(did);
+            state.request_rate.record(did, &inflight_model);
         }
 
         // Wrap with LoggedStream — log is written when stream finishes (Drop).
@@ -3351,7 +3351,7 @@ pub async fn messages(
         // Provider returned a response — count as a successfully handled request.
         state.agent_stats.record("/v1/messages");
         if let Some(ref did) = deployment_id {
-            state.request_rate.record(did);
+            state.request_rate.record(did, &inflight_model);
         }
 
         log_request(

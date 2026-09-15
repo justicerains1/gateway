@@ -360,18 +360,28 @@ async fn handle_update_model(
         visibility,
     };
 
-    let updated = DeploymentStore::update_db(db_pool, id, &input)
+    let old_model_name = DeploymentStore::update_db(db_pool, id, &input)
         .await
         .map_err(|e| format!("DB update failed: {}", e))?;
 
-    if !updated {
-        return Err("Model deployment not found".to_string());
-    }
+    let old_model_name = match old_model_name {
+        Some(name) => name,
+        None => return Err("Model deployment not found".to_string()),
+    };
 
     // Reload the affected model + wildcard from DB so the updated deployment
     // (new api_base/api_key/flow-control limits/serve_not_match toggle) takes
     // effect immediately. YAML persistence is best-effort in the dispatcher.
     reload_model_deployments(state, &req.model_name).await;
+
+    // Rename: converge the OLD model group too. Without this the old key
+    // keeps its stale providers — the old name stays visible in /v1/models,
+    // keeps routing, and stats reverse-lookup flips nondeterministically
+    // between old and new names. Reload (not blind removal) keeps any other
+    // deployments still configured under the old name.
+    if old_model_name != req.model_name {
+        reload_model_deployments(state, &old_model_name).await;
+    }
 
     Ok(json!({"ok": true}))
 }
@@ -415,6 +425,9 @@ async fn handle_delete_model(
     if let Some(did) = old_deployment_id.as_deref() {
         state.deployment_store.remove_deployment_by_deployment_id(did);
         state.flow_controller.remove_slot(did);
+        // Drop the deleted deployment's rate series too — otherwise its
+        // tracker entry lingers forever as an all-zero ghost chart card.
+        state.request_rate.remove(did);
     } else {
         // No deployment_id on the deleted row — fall back to a full reload of
         // the affected model + wildcard so the store stays consistent.

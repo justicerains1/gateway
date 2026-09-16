@@ -26,6 +26,7 @@ pub use inflight::{DeploymentInFlightStat, InFlightGuard, InFlightStat, InFlight
 pub use policy::load_helpers;
 pub use policy::SchedulePolicy;
 pub use policy::round_robin::RoundRobinPolicy;
+pub use policy::shuffle::ShufflePolicy;
 pub use policy::key_affinity::KeyAffinityPolicy;
 pub use policy::kvc_aware::KvcAwarePolicy;
 pub use rebalance::{RebalanceCounter, RebalanceMove, RebalanceMoveTracker};

@@ -7,7 +7,7 @@ use boom_kvindex::{TokenPrefixIndex};
 use boom_core::kv_event::KvIndexBackend;
 use boom_limiter::{PlanStore, RateLimitPlan, ScheduleSlot, SlidingWindowLimiter};
 use boom_flowcontrol::{FlowControlConfig, FlowController};
-use boom_routing::{register_fusion_providers, AliasStore, DeploymentStore, FusionRuntime, AutoRouter, InFlightTracker, KeyAffinityPolicy, MlServiceClient, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, StrategyRegistry, TierClassifier, VisibilityState, parse_allowed_teams, visibility_from_db};
+use boom_routing::{register_fusion_providers, AliasStore, DeploymentStore, FusionRuntime, AutoRouter, InFlightTracker, KeyAffinityPolicy, MlServiceClient, RebalanceMoveTracker, RequestRateTracker, Router, RoundRobinPolicy, SchedulePolicy, ShufflePolicy, StrategyRegistry, TierClassifier, VisibilityState, parse_allowed_teams, visibility_from_db};
 use boom_ctxaware::AgentStatsTracker;
 use boom_promptlog::PromptLogWriter;
 use boom_provider;
@@ -1643,6 +1643,10 @@ fn create_policy(
 ) -> Arc<dyn SchedulePolicy> {
     match config.router_settings.schedule_policy.as_str() {
         "round_robin" | "" => Arc::new(RoundRobinPolicy::new()),
+        "shuffle" => {
+            tracing::info!("Using shuffle policy (random pick, litellm simple-shuffle compatible)");
+            Arc::new(ShufflePolicy::new())
+        }
         "key_affinity" => {
             let ctx_threshold = config.router_settings.key_affinity_context_threshold;
             let rebalance_threshold = config.router_settings.rebalance_threshold;

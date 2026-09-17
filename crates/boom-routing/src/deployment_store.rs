@@ -865,10 +865,23 @@ impl DeploymentStore {
         Ok(row.get("id"))
     }
 
-    /// Update a deployment in DB by ID.
-    pub async fn update_db(pool: &sqlx::PgPool, id: uuid::Uuid, input: &DeploymentInput) -> Result<bool, sqlx::Error> {
+    /// Update a deployment in DB by ID. Returns the row's previous
+    /// model_name (None = row not found) so callers can converge the old
+    /// model group in memory when the update renamed it — otherwise the old
+    /// key keeps stale providers and lingers in /v1/models until a full
+    /// reload.
+    pub async fn update_db(
+        pool: &sqlx::PgPool,
+        id: uuid::Uuid,
+        input: &DeploymentInput,
+    ) -> Result<Option<String>, sqlx::Error> {
+        // The CTE captures the pre-update model_name from the statement's
+        // snapshot; RETURNING alone can only see the new row image.
         let result = sqlx::query(
-            r#"UPDATE boom_model_deployment
+            r#"WITH old AS (
+                   SELECT model_name FROM boom_model_deployment WHERE id = $1
+               )
+               UPDATE boom_model_deployment
                SET model_name = $2, litellm_model = $3,
                    api_key = COALESCE($4, api_key),
                    api_key_env = $5,
@@ -891,7 +904,8 @@ impl DeploymentStore {
                    allowed_teams = $25,
                    visibility = $26,
                    updated_at = NOW()
-               WHERE id = $1"#,
+               WHERE id = $1
+               RETURNING (SELECT model_name FROM old) AS old_model_name"#,
         )
         .bind(id)
         .bind(&input.model_name)
@@ -919,10 +933,10 @@ impl DeploymentStore {
         .bind(input.model_info.as_ref().unwrap_or(&serde_json::Value::Null))
         .bind(allowed_teams_json(&input.allowed_teams))
         .bind(visibility_str(input.visibility))
-        .execute(pool)
+        .fetch_optional(pool)
         .await?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(result.map(|row| row.get::<Option<String>, _>("old_model_name")).flatten())
     }
 
     /// Delete a deployment from DB by ID. Returns (model_name, deployment_id) of the deleted row.

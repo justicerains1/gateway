@@ -563,9 +563,9 @@ impl RoutingModelInvoker {
         })
     }
 
-    fn record_success(&self, deployment_id: Option<&str>) {
+    fn record_success(&self, deployment_id: Option<&str>, model: &str) {
         if let Some(deployment_id) = deployment_id {
-            self.runtime.request_rate.record(deployment_id);
+            self.runtime.request_rate.record(deployment_id, model);
         }
     }
 
@@ -709,7 +709,7 @@ impl ModelInvoker for RoutingModelInvoker {
                 return Err(error);
             }
         };
-        self.record_success(deployment_id.as_deref());
+        self.record_success(deployment_id.as_deref(), &requested_model);
         if let Some(ref usage) = response.usage {
             self.context.billing.add_actual_usage(usage);
             let cost = response_cost(&cost_rate, usage);
@@ -777,7 +777,7 @@ impl ModelInvoker for RoutingModelInvoker {
                 return Err(error);
             }
         };
-        self.record_success(deployment_id.as_deref());
+        self.record_success(deployment_id.as_deref(), &requested_model);
         let prompt_trace = prompt_call.and_then(|call_index| {
             self.context
                 .prompt_trace

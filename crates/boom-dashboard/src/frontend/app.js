@@ -3903,7 +3903,8 @@
     const opts2 = options.map((o) => {
       const val = typeof o === "string" ? o : o.value;
       const txt = typeof o === "string" ? o : o.label;
-      return `<option value="${esc(val)}" ${val === selected ? "selected" : ""}>${esc(txt)}</option>`;
+      const dis = typeof o === "string" ? false : !!o.disabled;
+      return `<option value="${esc(val)}" ${val === selected ? "selected" : ""}${dis ? " disabled" : ""}>${esc(txt)}</option>`;
     }).join("");
     return `<div class="form-group"><label for="${id}">${esc(label)}${fieldTipHTML(opts)}</label><select id="${id}">${opts2}</select></div>`;
   }
@@ -4088,13 +4089,34 @@
     </div>`;
   }
 
+  // Schedule-policy options. L2 (kvc_aware) is only selectable in debug
+  // builds (window.__KVC_DEBUG, injected at serve time by handlers_static
+  // via the debug-tools cargo feature). In release builds the option stays
+  // hidden — EXCEPT when it is already the live value: then it renders
+  // disabled-but-selected so saving this card can't silently flip an
+  // existing L2 cluster back to round_robin.
+  function buildPolicyOptions(current) {
+    const opts = [
+      { value: "round_robin", label: "L0 round_robin" },
+      { value: "shuffle", label: "L0 shuffle" },
+      { value: "key_affinity", label: "L1 key_affinity" },
+    ];
+    if (window.__KVC_DEBUG || current === "kvc_aware") {
+      opts.push({
+        value: "kvc_aware",
+        label: "L2 kvc_aware" + t("config.field.kvc_not_launched"),
+        disabled: !window.__KVC_DEBUG,
+      });
+    }
+    return opts;
+  }
+
   function renderCardRouter(r) {
     return `<div class="form-card" data-section="router_settings">
       <div class="form-card-title">${t("config.section.router_settings")}</div>
       <div class="form-card-grid">
-        ${fieldSelect("cfg-rs-policy", t("config.field.schedule_policy"),
-          [{ value: "round_robin", label: "L0 round_robin" }, { value: "key_affinity", label: "L1 key_affinity" }],
-          r.schedule_policy || "round_robin")}
+        ${fieldSelect("cfg-rs-policy", t("config.field.schedule_policy"), buildPolicyOptions(r.schedule_policy),
+          r.schedule_policy || "round_robin", { tip: t("tip.config.schedule_policy") })}
         ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0 })}
         ${fieldNum("cfg-rs-affinity-rebal", t("config.field.rebalance_threshold"), r.rebalance_threshold || 20, { min: 1, step: 1 })}
         ${fieldNum("cfg-rs-flow-timeout", t("config.field.flow_control_queue_timeout_secs"), r.flow_control_queue_timeout_secs || 1200, { min: 1, step: 1 })}
@@ -4103,13 +4125,12 @@
         ${fieldFullList("cfg-rs-forward-hdrs", t("config.field.forward_client_headers"), r.forward_client_headers || [])}
         ${fieldTextarea("cfg-rs-aliases", t("config.field.model_group_alias"), r.model_group_alias || {}, { rows: 3 })}
       </div>
-      <details class="form-card-collapsible is-disabled">
+      <details class="form-card-collapsible" id="cfg-kvc-details">
         <summary>
           <span>${t("config.section.kvc_aware")}</span>
-          <span class="badge-wip">${t("common.wip")}</span>
         </summary>
-        <p class="modal-hint">${t("config.tip.kvc_aware_wip")}</p>
-        <div class="form-card-grid" aria-disabled="true">
+        <p class="modal-hint">${t("config.tip.kvc_aware")}</p>
+        <div class="form-card-grid">
           ${fieldNum("cfg-kvc-block", t("config.field.block_size"), (r.kvc_aware || {}).block_size, { min: 1 })}
           ${fieldNum("cfg-kvc-cache-w", t("config.field.cache_weight"), (r.kvc_aware || {}).cache_weight, { step: "0.05" })}
           ${fieldNum("cfg-kvc-load-w", t("config.field.load_weight"), (r.kvc_aware || {}).load_weight, { step: "0.05" })}
@@ -4120,7 +4141,6 @@
       </details>
       <div class="form-card-actions">
         <button class="btn-primary btn-small" data-save="router">${t("action.save")}</button>
-        <button class="btn-secondary btn-small" data-save="kvc_aware" disabled title="${esc(t("config.tip.kvc_aware_wip"))}">${t("config.action.save_kvc")}</button>
       </div>
     </div>`;
   }
@@ -4170,6 +4190,15 @@
         saveConfigSectionKind(kind, cfg);
       });
     });
+    // Selecting the L2 policy auto-expands the KV-cache parameter card —
+    // those fields only take effect under kvc_aware.
+    const policySel = document.getElementById("cfg-rs-policy");
+    const kvcDetails = document.getElementById("cfg-kvc-details");
+    if (policySel && kvcDetails) {
+      policySel.addEventListener("change", () => {
+        if (policySel.value === "kvc_aware") kvcDetails.open = true;
+      });
+    }
     const reloadBtn = document.getElementById("btn-reload-config-page");
     if (reloadBtn) reloadBtn.addEventListener("click", reloadConfigHandler);
     wireConfigSidebar();
@@ -4535,18 +4564,21 @@
           strip_claude_code_attribution: $("cfg-rs-strip-cc").checked,
           forward_client_headers: parseListInput($("cfg-rs-forward-hdrs")),
           model_group_alias: aliases,
+          // The backend replaces the whole router_settings section, so every
+          // sub-tree must be re-submitted. kvc_aware reads the live inputs
+          // (its card shares this save button); auto_router has no editor and
+          // is passed through verbatim.
+          kvc_aware: {
+            block_size: numOr($("cfg-kvc-block"), 512),
+            cache_weight: numOr($("cfg-kvc-cache-w"), 0.7),
+            load_weight: numOr($("cfg-kvc-load-w"), 0.3),
+            max_blocks: numOr($("cfg-kvc-max-blocks"), 500000),
+            overload_threshold_pct: numOr($("cfg-kvc-overload"), 90),
+            router_ttl_secs: numOr($("cfg-kvc-ttl"), 1200),
+          },
+          auto_router: cfg.router_settings.auto_router ?? null,
         };
         await saveConfigSection("router_settings", routerValue);
-      } else if (kind === "kvc_aware") {
-        const kvcValue = {
-          block_size: numOr($("cfg-kvc-block"), 16),
-          cache_weight: numOr($("cfg-kvc-cache-w"), 0.5),
-          load_weight: numOr($("cfg-kvc-load-w"), 0.2),
-          max_blocks: numOr($("cfg-kvc-max-blocks"), 500000),
-          overload_threshold_pct: numOr($("cfg-kvc-overload"), 90),
-          router_ttl_secs: numOr($("cfg-kvc-ttl"), 1200),
-        };
-        await saveConfigSection("router_settings.kvc_aware", kvcValue);
       }
     } catch (err) { alert(t("common.error_prefix", { message: err.message })); }
   }

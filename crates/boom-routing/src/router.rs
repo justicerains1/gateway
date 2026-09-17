@@ -219,12 +219,18 @@ impl Router {
     }
 
     /// Return all model names that should be visible in the model list.
+    ///
+    /// Empty groups are filtered out: delete/rename paths deliberately keep an
+    /// empty key under the old model_name (to suppress wildcard fallthrough),
+    /// so without this filter deleted models would linger in /v1/models until
+    /// the next full reload. A model with zero routable deployments (deleted,
+    /// renamed-away, or all deployments disabled) is not listable.
     pub fn visible_model_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .deployment_store
             .model_names()
             .into_iter()
-            .filter(|k| k != "*")
+            .filter(|k| k != "*" && self.deployment_store.deployment_count(k) > 0)
             .collect();
 
         for alias_name in self.alias_store.visible_names() {

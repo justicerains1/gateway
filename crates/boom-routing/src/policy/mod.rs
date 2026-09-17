@@ -2,6 +2,7 @@ pub mod key_affinity;
 pub mod kvc_aware;
 pub mod load_helpers;
 pub mod round_robin;
+pub mod shuffle;
 
 use boom_core::provider::Provider;
 use std::sync::Arc;

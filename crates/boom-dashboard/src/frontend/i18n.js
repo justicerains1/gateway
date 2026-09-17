@@ -523,7 +523,6 @@
       "common.items_count": "{n} items",
       "common.keys_count": "{n} keys",
       "common.actions": "Actions",
-      "common.wip": "WIP",
 
       "action.copy": "Copy",
       "action.done": "Done",
@@ -799,7 +798,9 @@
       "config.section.cost_templates": "Cost Templates",
       "config.section.model_list": "Model List",
       "config.section.kvc_aware": "KV-cache Aware (advanced)",
-      "config.tip.kvc_aware_wip": "KV-cache aware routing is still in development. Configuration here is not yet honored — fields are shown for preview only.",
+      "config.field.kvc_not_launched": " (not officially launched)",
+      "config.tip.kvc_aware": "Takes effect only when Schedule Policy is L2 kvc_aware. Changing block_size or switching the policy rebuilds the learned prefix trie (cold restart); weight/threshold changes are hot-updated without wiping it.",
+      "tip.config.schedule_policy": "L0 round_robin: spread evenly in fixed order. L0 shuffle: random pick per request (litellm simple-shuffle). L1 key_affinity: stick each API key to one backend (session affinity). L2 kvc_aware: prefix-cache affinity — route by predicted prefix hit ratio + load (debug builds only).",
       "config.group.runtime": "Runtime",
       "config.group.traffic": "Traffic & Billing",
       "config.group.routing": "Routing & Models",
@@ -896,7 +897,6 @@
       "config.field.cached_input_cost_per_million_tokens": "Cached ¥/M",
       "config.field.output_cost_per_million_tokens": "Output ¥/M",
 
-      "config.action.save_kvc": "Save KV-cache",
       "config.action.add_template": "+ Add Template",
       "config.action.edit_template": "Edit Template",
       "config.action.manage_models": "Manage on Models page →",
@@ -1460,7 +1460,6 @@
       "common.items_count": "{n} 项",
       "common.keys_count": "{n} 键",
       "common.actions": "操作",
-      "common.wip": "开发中",
 
       "action.copy": "复制",
       "action.done": "完成",
@@ -1736,7 +1735,9 @@
       "config.section.cost_templates": "成本模板",
       "config.section.model_list": "模型列表",
       "config.section.kvc_aware": "KV 缓存感知(高级)",
-      "config.tip.kvc_aware_wip": "KV 缓存感知路由正在开发中,此处配置暂不生效,字段仅供预览。",
+      "config.field.kvc_not_launched": "（未正式上线）",
+      "config.tip.kvc_aware": "仅当调度策略选择 L2 kvc_aware 时生效。修改块大小或切换策略会重建前缀学习树（冷启动重新学习）；权重/阈值改动热更新、不清空学习树。",
+      "tip.config.schedule_policy": "L0 round_robin：固定顺序轮询均摊。L0 shuffle：每请求随机选择（litellm simple-shuffle）。L1 key_affinity：按 API key 会话亲和固定后端。L2 kvc_aware：前缀缓存亲和——按预测前缀命中率 + 负载统一评分路由（仅 debug 构建可选）。",
       "config.group.runtime": "运行时",
       "config.group.traffic": "流量与计费",
       "config.group.routing": "路由与模型",
@@ -1833,7 +1834,6 @@
       "config.field.cached_input_cost_per_million_tokens": "缓存 ¥/M",
       "config.field.output_cost_per_million_tokens": "输出 ¥/M",
 
-      "config.action.save_kvc": "保存 KV 缓存",
       "config.action.add_template": "+ 新增模板",
       "config.action.edit_template": "编辑模板",
       "config.action.manage_models": "在模型页面管理 →",

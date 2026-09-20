@@ -3819,7 +3819,7 @@
   function renderConfigPage(cfg) {
     const items = [
       { group: "runtime", section: "runtime-server",       label: t("config.section.server"),                icon: "server",       html: renderCardServer(cfg.server || {}) },
-      { group: "runtime", section: "runtime-general",      label: t("config.section.general_settings"),     icon: "general",       html: renderCardGeneral(cfg.general_settings || {}) },
+      { group: "runtime", section: "runtime-general",      label: t("config.section.general_settings"),     icon: "general",       html: renderCardGeneral(cfg.general_settings || {}, cfg.router_settings || {}) },
       { group: "runtime", section: "runtime-health",       label: t("config.section.deployment_health_check"), icon: "health",     html: renderCardHealthCheck(cfg.deployment_health_check || {}) },
       { group: "runtime", section: "runtime-prompt-log",   label: t("config.section.prompt_log"),            icon: "prompt-log",   html: renderCardPromptLog(cfg.prompt_log || {}) },
       { group: "runtime", section: "runtime-trace",        label: t("config.section.trace"),                 icon: "trace",        html: renderCardTrace(cfg.trace || {}) },
@@ -3927,15 +3927,21 @@
     </div>`;
   }
 
-  function renderCardGeneral(g) {
+  function renderCardGeneral(g, router) {
     const masked = (v) => v ? "****" : "(" + t("common.none_option") + ")";
     return `<div class="form-card" data-section="general">
       <div class="form-card-title">${t("config.section.general_settings")}</div>
       <div class="form-card-grid">
         <div class="form-group"><label>${t("config.field.master_key")}</label><input value="${esc(masked(g.master_key))}" readonly style="opacity:.6"></div>
         <div class="form-group"><label>${t("config.field.database_url")}</label><input value="${esc(masked(g.database_url))}" readonly style="opacity:.6"></div>
+        ${fieldCheckbox("cfg-gen-priority-hdr", t("config.field.enable_priority_header"), router.enable_priority_header)}
+        ${fieldCheckbox("cfg-gen-strip-cc", t("config.field.strip_claude_code_attribution"), router.strip_claude_code_attribution)}
+        ${fieldFullList("cfg-gen-forward-hdrs", t("config.field.forward_client_headers"), router.forward_client_headers || [])}
       </div>
       <p class="modal-hint">${t("config.tip.master_key_readonly")}</p>
+      <div class="form-card-actions">
+        <button class="btn-primary btn-small" data-save="general">${t("action.save")}</button>
+      </div>
     </div>`;
   }
 
@@ -4120,10 +4126,6 @@
         ${fieldNum("cfg-rs-affinity-ctx", t("config.field.key_affinity_context_threshold"), r.key_affinity_context_threshold || 0, { min: 0 })}
         ${fieldNum("cfg-rs-affinity-rebal", t("config.field.rebalance_threshold"), r.rebalance_threshold || 20, { min: 1, step: 1 })}
         ${fieldNum("cfg-rs-flow-timeout", t("config.field.flow_control_queue_timeout_secs"), r.flow_control_queue_timeout_secs || 1200, { min: 1, step: 1 })}
-        ${fieldCheckbox("cfg-rs-priority-hdr", t("config.field.enable_priority_header"), r.enable_priority_header)}
-        ${fieldCheckbox("cfg-rs-strip-cc", t("config.field.strip_claude_code_attribution"), r.strip_claude_code_attribution)}
-        ${fieldFullList("cfg-rs-forward-hdrs", t("config.field.forward_client_headers"), r.forward_client_headers || [])}
-        ${fieldTextarea("cfg-rs-aliases", t("config.field.model_group_alias"), r.model_group_alias || {}, { rows: 3 })}
       </div>
       <details class="form-card-collapsible" id="cfg-kvc-details">
         <summary>
@@ -4483,6 +4485,15 @@
           port: numOr($("cfg-server-port"), 4000),
           workers: numOr($("cfg-server-workers"), 4),
         });
+      } else if (kind === "general") {
+        // These three live under router_settings in YAML but are surfaced on
+        // the General card. Sub-path writes avoid replacing the whole
+        // router_settings section (which would clobber scheduling fields).
+        await saveConfigSections([
+          ["router_settings.enable_priority_header", $("cfg-gen-priority-hdr").checked],
+          ["router_settings.strip_claude_code_attribution", $("cfg-gen-strip-cc").checked],
+          ["router_settings.forward_client_headers", parseListInput($("cfg-gen-forward-hdrs"))],
+        ]);
       } else if (kind === "rate_limit") {
         const tpmRaw = $("cfg-rl-default-tpm").value;
         await saveConfigSection("rate_limit", {
@@ -4554,16 +4565,20 @@
           },
         });
       } else if (kind === "router") {
-        const aliases = parseJsonInput($("cfg-rs-aliases"), {});
         const routerValue = {
           schedule_policy: $("cfg-rs-policy").value,
           key_affinity_context_threshold: numOr($("cfg-rs-affinity-ctx"), 0),
           rebalance_threshold: numOr($("cfg-rs-affinity-rebal"), 20),
           flow_control_queue_timeout_secs: numOr($("cfg-rs-flow-timeout"), 1200),
-          enable_priority_header: $("cfg-rs-priority-hdr").checked,
-          strip_claude_code_attribution: $("cfg-rs-strip-cc").checked,
-          forward_client_headers: parseListInput($("cfg-rs-forward-hdrs")),
-          model_group_alias: aliases,
+          // These three editors live on the General card; their inputs are
+          // still in the DOM when this save fires (config page renders all
+          // cards at once, hidden panels included).
+          enable_priority_header: $("cfg-gen-priority-hdr").checked,
+          strip_claude_code_attribution: $("cfg-gen-strip-cc").checked,
+          forward_client_headers: parseListInput($("cfg-gen-forward-hdrs")),
+          // No editor here — managed on the Models page (alias CRUD writes
+          // DB + memory directly). Pass through verbatim like auto_router.
+          model_group_alias: cfg.router_settings.model_group_alias ?? {},
           // The backend replaces the whole router_settings section, so every
           // sub-tree must be re-submitted. kvc_aware reads the live inputs
           // (its card shares this save button); auto_router has no editor and
@@ -4584,7 +4599,16 @@
   }
 
   async function saveConfigSection(path, value) {
-    await api("/admin/config", { method: "PUT", body: JSON.stringify({ path, value }) });
+    await saveConfigSections([[path, value]]);
+  }
+
+  // Multi-section save: fires all PUTs first, then a single page reload.
+  // Reloading between writes would drop the other sections' DOM inputs
+  // before they are read.
+  async function saveConfigSections(pairs) {
+    for (const [path, value] of pairs) {
+      await api("/admin/config", { method: "PUT", body: JSON.stringify({ path, value }) });
+    }
     showToast(t("config.saved"));
     await loadConfigPage();
   }

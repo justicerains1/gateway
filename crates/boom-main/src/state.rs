@@ -1123,14 +1123,15 @@ async fn load_db_only_deployments(
         let state = visibility_from_db(&row.visibility, &row.allowed_teams);
         deployment_store.set_visibility(&row.model_name, state);
 
-        let mut extra = std::collections::HashMap::new();
+        let mut custom_headers = std::collections::HashMap::new();
         if let Some(obj) = row.headers.as_object() {
             for (k, v) in obj {
                 if let Some(s) = v.as_str() {
-                    extra.insert(k.clone(), s.to_string());
+                    custom_headers.insert(k.clone(), s.to_string());
                 }
             }
         }
+        let mut extra = std::collections::HashMap::new();
         if let Some(ref v) = row.api_version {
             extra.insert("api_version".to_string(), v.clone());
         }
@@ -1152,6 +1153,7 @@ async fn load_db_only_deployments(
             row.api_base.clone(),
             row.timeout as u64,
             &extra,
+            &custom_headers,
             row.deployment_id.clone(),
             row.client_type_header.unwrap_or(false),
         ) {
@@ -1315,7 +1317,7 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
     for entry in &config.model_list {
         let p = &entry.litellm_params;
 
-        let mut extra = p.headers.clone();
+        let mut extra = std::collections::HashMap::new();
         if let Some(ref v) = p.api_version {
             extra.insert("api_version".to_string(), v.clone());
         }
@@ -1352,6 +1354,7 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
             p.api_base.clone(),
             p.timeout,
             &extra,
+            &p.headers,
             deployment_id,
             entry.client_type_header,
         ) {

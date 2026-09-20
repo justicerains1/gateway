@@ -174,6 +174,7 @@ pub struct OpenAIProvider {
     deployment_id: Option<String>,
     kv_worker_id: Option<String>,
     client_type_header: bool,
+    custom_headers: Vec<(String, String)>,
 }
 
 impl OpenAIProvider {
@@ -195,7 +196,13 @@ impl OpenAIProvider {
             deployment_id,
             kv_worker_id,
             client_type_header,
+            custom_headers: Vec::new(),
         }
+    }
+
+    pub fn with_custom_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.custom_headers = headers;
+        self
     }
 
     fn build_request(&self, mut req: ChatCompletionRequest) -> serde_json::Value {
@@ -252,9 +259,7 @@ impl Provider for OpenAIProvider {
         if let Some(ref key) = self.api_key {
             builder = builder.bearer_auth(key);
         }
-        for (name, value) in &gateway_headers {
-            builder = builder.header(name, value);
-        }
+        builder = crate::apply_gateway_headers(builder, &gateway_headers);
 
         let resp = builder
             .json(&body)
@@ -343,9 +348,7 @@ impl Provider for OpenAIProvider {
         if let Some(ref key) = self.api_key {
             builder = builder.bearer_auth(key);
         }
-        for (name, value) in &gateway_headers {
-            builder = builder.header(name, value);
-        }
+        builder = crate::apply_gateway_headers(builder, &gateway_headers);
 
         let resp = builder
             .json(&body)
@@ -486,6 +489,10 @@ impl Provider for OpenAIProvider {
 
     fn client_type_header(&self) -> bool {
         self.client_type_header
+    }
+
+    fn custom_headers(&self) -> &[(String, String)] {
+        &self.custom_headers
     }
 }
 

@@ -260,6 +260,17 @@ pub trait Provider: Send + Sync + 'static {
     fn client_type_header(&self) -> bool {
         false
     }
+
+    /// Deployment-level custom headers (`litellm_params.headers`), already
+    /// sanitized at provider creation: reserved config keys, spoof-blocked
+    /// names ([`crate::is_hard_blocked_header`]) and transport-critical
+    /// names are dropped. The route layer composes them into
+    /// `ChatCompletionRequest::gateway_headers` between the client
+    /// whitelist pass and the gateway-injected pass — merge priority:
+    /// gateway-injected > deployment custom > client-whitelisted.
+    fn custom_headers(&self) -> &[(String, String)] {
+        &[]
+    }
 }
 
 /// Rate limiter trait was removed during the limiter normalization refactor

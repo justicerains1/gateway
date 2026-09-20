@@ -302,19 +302,21 @@ pub struct ChatCompletionRequest {
     /// touches serde (never parsed from client body, preventing spoofing;
     /// never serialized into the upstream JSON body).
     ///
-    /// Carries two categories, merged by the route layer:
+    /// Carries three categories, merged by the route layer:
     /// 1. **Client-whitelisted headers** — entries from the client's
     ///    `HeaderMap` whose lowercased name appears in
     ///    `router_settings.forward_client_headers` (after hard-blocking
-    ///    `x-gateway-*`, `x-boom-*`, `authorization`, `x-api-key`,
-    ///    `api-key`, `cookie`, `set-cookie`, `surrogate-key`).
-    /// 2. **Gateway-injected headers** — `X-Gateway-Priority`,
+    ///    via [`is_hard_blocked_header`]).
+    /// 2. **Deployment custom headers** — the deployment's
+    ///    `litellm_params.headers` map, sanitized at provider creation.
+    ///    Overrides same-named client-whitelisted values.
+    /// 3. **Gateway-injected headers** — `X-Gateway-Priority`,
     ///    `X-BooM-Client-Type`, etc., built by `build_gateway_headers`.
     ///
-    /// Gateway-injected entries are inserted **after** the client whitelist
-    /// pass, so they override any same-named client value (operators cannot
-    /// let a client spoof VIP priority by listing `x-gateway-priority` in
-    /// the whitelist — that name is hard-blocked anyway).
+    /// Merge priority is fixed: gateway-injected > deployment custom >
+    /// client-whitelisted. Operators cannot let a client spoof VIP priority
+    /// by listing `x-gateway-priority` in the whitelist — that name is
+    /// hard-blocked anyway (see [`is_hard_blocked_header`]).
     #[serde(skip)]
     pub gateway_headers: HashMap<String, String>,
     /// Internal flag: when true, the gateway asks the upstream inference engine
@@ -333,6 +335,27 @@ pub struct ChatCompletionRequest {
     /// never serialized into the upstream JSON.
     #[serde(skip)]
     pub raw_capture: Option<crate::provider::SharedRawCapture>,
+}
+
+/// Header names/prefixes that must never be sourced from client input or
+/// deployment `headers` config — the single source of truth for the
+/// gateway's header-spoofing policy. Shared by the client-whitelist pass
+/// (`boom_main::routes::forward_client_headers`) and the deployment custom
+/// header sanitizer (`boom_provider::create_provider`).
+///
+/// - `x-gateway-*`, `x-boom-*` — gateway-controlled (priority, client type)
+/// - `authorization`, `x-api-key`, `api-key` — provider re-injects from
+///   deployment credentials; configurable per-source would break the
+///   gateway's key management
+/// - `cookie`, `set-cookie` — RFC 6265 proxy stripping, prevents session leakage
+/// - `surrogate-key` — gateway routes KV-cache by `key_hash`, never client
+pub fn is_hard_blocked_header(lower_name: &str) -> bool {
+    lower_name.starts_with("x-gateway-")
+        || lower_name.starts_with("x-boom-")
+        || matches!(
+            lower_name,
+            "authorization" | "x-api-key" | "api-key" | "cookie" | "set-cookie" | "surrogate-key"
+        )
 }
 
 // ============================================================
@@ -997,4 +1020,32 @@ where
             },
         })
         .collect())
+}
+
+#[cfg(test)]
+mod header_policy_tests {
+    use crate::is_hard_blocked_header;
+
+    #[test]
+    fn blocks_gateway_controlled_prefixes_and_auth_session_names() {
+        for name in [
+            "x-gateway-priority",
+            "x-boom-client-type",
+            "authorization",
+            "x-api-key",
+            "api-key",
+            "cookie",
+            "set-cookie",
+            "surrogate-key",
+        ] {
+            assert!(is_hard_blocked_header(name), "{name} must be blocked");
+        }
+    }
+
+    #[test]
+    fn allows_ordinary_custom_names() {
+        for name in ["x-request-id", "user-agent", "anthropic-beta", "x-custom-header"] {
+            assert!(!is_hard_blocked_header(name), "{name} must be allowed");
+        }
+    }
 }

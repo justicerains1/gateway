@@ -11,19 +11,21 @@ use super::{SchedulePolicy, Selection};
 
 /// KV-cache aware scheduling policy (self-contained, no vLLM event dependency).
 ///
-/// Scores EVERY candidate on a single unified axis combining prefix affinity
-/// (cache hit) and gateway-side load (inflight as % of capacity):
-///   score = cache_weight × hit_ratio + load_weight × (1 − load_pct/100)
-/// Higher is better. Overloaded workers (load_pct > overload_threshold_pct)
-/// are HARD-EXCLUDED before scoring; only if all are overloaded does it fall
-/// back to lowest-load. Ties on the top score are broken by round-robin
-/// (counter) so traffic spreads evenly when affinity/load don't differentiate.
+/// Scores every candidate on ONE axis — prefix affinity:
+///   score = hit_ratio
+/// Higher is better. Ties on the top score (including the all-cold case,
+/// where every candidate scores 0) are broken by round-robin, so cold
+/// traffic spreads evenly without a load term. Load balancing is delegated
+/// to the router-level rebalance_threshold: when the affinity winner is
+/// markedly more loaded than the least-loaded candidate, the request is
+/// handed off (same policy as key_affinity). There is NO overload gate —
+/// a warm worker keeps winning regardless of load, and only the rebalance
+/// threshold can move traffic away.
 ///
 /// The trie is self-learned: the orchestrator records each routed request's
-/// prefix under the chosen worker, so a miss (hit=0) simply scores by load —
-/// no key_affinity fallback. The capacity rebalance hands off to a less-loaded
-/// candidate when the winner is overloaded; the orchestrator then records the
-/// new worker (add-only, no migration of old entries — aligned with dynamo).
+/// prefix under the chosen worker, so a miss (hit=0) just round-robins —
+/// no key_affinity fallback. The orchestrator then records the new worker
+/// (add-only, no migration of old entries — aligned with dynamo).
 pub struct KvcAwarePolicy {
     /// Reference to the KV-cache prefix index.
     kv_index: Arc<dyn KvIndexBackend>,
@@ -31,23 +33,12 @@ pub struct KvcAwarePolicy {
     tracker: Arc<InFlightTracker>,
     /// Optional flow control queue info for total load (in-flight + queued).
     queue_info: Option<Arc<dyn DeploymentQueueInfo>>,
-    /// Weight for the cache-hit term in the unified score.
-    cache_weight: f64,
-    /// Weight for the load term in the unified score.
-    load_weight: f64,
-    /// A candidate whose inflight load ≥ this % of capacity is excluded
-    /// (hard overload gate). 100 = disabled.
-    overload_threshold_pct: u64,
     /// Load-balance threshold: when the winner's load_pct exceeds the lowest
-    /// non-overloaded candidate's load_pct by more than this, hand off to the
-    /// least-loaded candidate. 100 = disabled.
+    /// candidate's load_pct by more than this, hand off to the least-loaded
+    /// candidate. 100 = disabled.
     rebalance_threshold: u64,
     /// Round-robin counter for tie-breaking among equal top scores (LB).
     tie_counter: AtomicU64,
-    /// Counter for rate-limiting the all-overloaded warn (log once at first
-    /// occurrence, then every `OVERLOAD_WARN_EVERY` requests — an overload
-    /// storm must not flood the warn channel at per-request rate).
-    overload_warn_counter: AtomicU64,
     /// Optional tracker for rebalance-move counters (Debug page "Rebalance Moves").
     /// Records (from, to) deployment ids on each capacity rebalance handoff.
     rebalance_move_tracker: Option<Arc<RebalanceMoveTracker>>,
@@ -63,27 +54,15 @@ impl KvcAwarePolicy {
             kv_index,
             tracker,
             queue_info: None,
-            cache_weight: 0.5,
-            load_weight: 0.5,
-            overload_threshold_pct: 100,
             rebalance_threshold: 100,
             tie_counter: AtomicU64::new(0),
-            overload_warn_counter: AtomicU64::new(0),
             rebalance_move_tracker,
         }
     }
 
-    /// Configure the unified-score weights and the hard overload gate.
-    pub fn set_scoring(
-        &mut self,
-        cache_weight: f64,
-        load_weight: f64,
-        overload_threshold_pct: u64,
-        rebalance_threshold: u64,
-    ) {
-        self.cache_weight = cache_weight;
-        self.load_weight = load_weight;
-        self.overload_threshold_pct = overload_threshold_pct;
+    /// Configure the load-balance hand-off threshold (router-level setting
+    /// shared with key_affinity; 100 = disabled).
+    pub fn set_rebalance_threshold(&mut self, rebalance_threshold: u64) {
         self.rebalance_threshold = rebalance_threshold;
     }
 
@@ -199,10 +178,10 @@ impl SchedulePolicy for KvcAwarePolicy {
         // hit_blocks / input_blocks instead of just the ratio.
         let request_total_blocks: u64 = self.kv_index.prefix_block_count(prefix_bytes);
 
-        // Score EVERY candidate on the unified axis. Unmatched candidates get
-        // hit = 0 but still compete on load — this is what makes LB work across
-        // independent deployments (a cold, idle worker can win when the cached
-        // one is loaded). Overloaded workers are hard-excluded.
+        // Score EVERY candidate on the affinity axis. Unmatched candidates
+        // get hit = 0 — all-cold requests tie at 0 and are spread by the
+        // round-robin below. Load is not part of the score; the rebalance
+        // stage below is the only load-based intervention.
         struct Scored {
             score: f64,
             provider: Arc<dyn Provider>,
@@ -210,7 +189,7 @@ impl SchedulePolicy for KvcAwarePolicy {
             depth: u64,
             load_pct: u64,
         }
-        // Score one candidate on the unified axis.
+        // Score one candidate: pure prefix hit_ratio.
         let score_cand = |cand: &Arc<dyn Provider>| -> Scored {
             // Effective hit/depth = max across the candidate's own worker and
             // its KV-sharing peers (a peer's cached prefix is reusable via the
@@ -230,49 +209,10 @@ impl SchedulePolicy for KvcAwarePolicy {
                 })
                 .unwrap_or((0.0, 0));
             let load_pct = deployment_load(&self.tracker, &self.queue_info, model, cand.as_ref());
-            let load_avail = 1.0 - (load_pct.min(100) as f64 / 100.0);
-            let score = self.cache_weight * hit + self.load_weight * load_avail;
-            Scored { score, provider: cand.clone(), hit, depth, load_pct }
+            Scored { score: hit, provider: cand.clone(), hit, depth, load_pct }
         };
 
-        // Pass 1: score candidates with the overload gate applied.
-        let mut scored: Vec<Scored> = Vec::new();
-        let mut overloaded: Vec<String> = Vec::new();
-        for cand in candidates {
-            let pre = score_cand(cand);
-            if self.overload_threshold_pct < 100
-                && pre.load_pct >= self.overload_threshold_pct
-            {
-                overloaded.push(cand.kv_worker_id().unwrap_or("?").to_string());
-                continue;
-            }
-            scored.push(pre);
-        }
-
-        // All candidates overloaded → do NOT fall back to lowest-load. Under
-        // full overload load-balancing has nothing left to win: hopping to the
-        // marginally-less-loaded worker oscillates (W1↔W2 churn observed in
-        // production) and abandons warm caches for no capacity relief.
-        // Instead the gate is lifted and the normal unified score decides —
-        // cache affinity keeps requests on their warm worker, and rebalance
-        // is suppressed below so no hand-off migration happens either.
-        let all_overloaded = scored.is_empty();
-        if all_overloaded {
-            // Rate-limited: first occurrence + every 10_000th request. An
-            // overload storm is exactly when the warn channel matters — one
-            // line per request would drown every other alert.
-            const OVERLOAD_WARN_EVERY: u64 = 10_000;
-            let n = self.overload_warn_counter.fetch_add(1, Ordering::Relaxed);
-            if n == 0 || n % OVERLOAD_WARN_EVERY == 0 {
-                tracing::warn!(
-                    model,
-                    ?overloaded,
-                    occurrences = n + 1,
-                    "all candidates overloaded, overload gate lifted — affinity pick (no migration)"
-                );
-            }
-            scored = candidates.iter().map(score_cand).collect();
-        }
+        let scored: Vec<Scored> = candidates.iter().map(score_cand).collect();
 
         // Pick the top score; round-robin among exact ties so equal-score
         // candidates (e.g. both cold + equally idle) split traffic evenly.
@@ -318,10 +258,9 @@ impl SchedulePolicy for KvcAwarePolicy {
         // No candidate had any KV-cache hit for this request (winner.hit == 0):
         // the trie hasn't learned this prefix yet (cold). The orchestrator
         // records the chosen winner after routing, so the next request with the
-        // same prefix will hit. No key_affinity fallback — the unified score
-        // (hit=0 → load_weight·load_avail) plus the capacity rebalance below
-        // pick a reasonable worker, and the record step makes subsequent
-        // requests sticky to it.
+        // same prefix will hit. No key_affinity fallback — all-cold candidates
+        // tie at score 0 and the round-robin above spreads them; the record
+        // step then makes subsequent requests sticky to the winner.
 
         // Trie fill for diagnostics. `trie_nodes` (live trie nodes) vs
         // `trie_blocks` (claims): the gap is the shell population — nodes
@@ -333,16 +272,14 @@ impl SchedulePolicy for KvcAwarePolicy {
         let trie_nodes = self.kv_index.node_count();
 
         // Rebalance: when the winner is markedly more loaded than the least-
-        // loaded non-overloaded candidate, hand off to the least-loaded so
-        // traffic spreads by capacity — same policy as key_affinity (pure
-        // load balancing; target is NOT picked by cache score). Disabled
-        // when rebalance_threshold >= 100, and suppressed when ALL candidates
-        // were overloaded — with everything saturated there is no spare
-        // capacity to spread into, and handing off would just re-ignite the
-        // oscillation the gate-lift above avoids. Only runs on the
+        // loaded candidate, hand off to the least-loaded so traffic spreads
+        // by capacity — same policy as key_affinity (pure load balancing;
+        // target is NOT picked by cache score). This is the ONLY load-based
+        // intervention left (no overload gate, no load term in the score).
+        // Disabled when rebalance_threshold >= 100. Only runs on the
         // non-degraded path (degraded = empty prefix → lowest_load, returns
         // early before this stage).
-        let winner = if self.rebalance_threshold < 100 && !all_overloaded {
+        let winner = if self.rebalance_threshold < 100 {
             let load_winner = winner.load_pct;
             let least_loaded = scored
                 .iter()
@@ -385,7 +322,6 @@ impl SchedulePolicy for KvcAwarePolicy {
                 load_pct = winner.load_pct,
                 score = format!("{:.3}", winner.score),
                 candidates = candidates.len(),
-                overloaded = ?overloaded,
                 ties = ties.len(),
                 trie_blocks,
                 trie_capacity,
@@ -403,13 +339,12 @@ impl SchedulePolicy for KvcAwarePolicy {
                 load_pct = winner.load_pct,
                 score = format!("{:.3}", winner.score),
                 candidates = candidates.len(),
-                overloaded = ?overloaded,
                 ties = ties.len(),
                 trie_blocks,
                 trie_capacity,
                 trie_nodes,
                 request_bytes = prefix_bytes.len(),
-                "KVC selected (cold, load+round-robin)"
+                "KVC selected (cold, round-robin)"
             );
         }
         Some(Selection {
@@ -418,7 +353,7 @@ impl SchedulePolicy for KvcAwarePolicy {
             kv_hit_blocks: winner.depth,
             kv_input_blocks: request_total_blocks,
             kv_match_attempted: true,
-            degraded: all_overloaded,
+            degraded: false,
         })
     }
 

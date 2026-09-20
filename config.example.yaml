@@ -138,26 +138,18 @@ router_settings:
   # ── kvc_aware：自包含前缀亲和路由（零外部依赖）──────────────────────
   # 启用：routing_strategy: kvc_aware
   # 原理：gateway 把每个请求的前缀（system+tools+messages）序列化成字节，
-  #       按 block_size 切块、xxhash 当 trie 边 key；路由选中 worker 后把
-  #       该前缀记到 worker 名下，下个相同前缀的请求即命中。不调 vLLM
-  #       /tokenize、不订阅 ZMQ、不需要 tokenizer 文件。
+  #       按 512B 代码常量切块（非配置项）、xxhash 当 trie 边 key；路由选中
+  #       worker 后把该前缀记到 worker 名下，下个相同前缀的请求即命中。
+  #       不调 vLLM /tokenize、不订阅 ZMQ、不需要 tokenizer 文件。
+  #       打分为纯前缀亲和（score = 命中率）；冷请求并列 0 分由 round-robin
+  #       摊开，负载干预仅剩 router 级 rebalance_threshold。
   # routing_strategy: kvc_aware
   # kvc_aware:
-  #   # 块大小（字节）。512 ≈ 128 token（英文）/ ~170 token（中文）。
-  #   # 整个请求前缀全部记录（无单请求块数上限），链深随上下文增长
-  #   #（1M token 上下文 ≈ 8000 块）；所有释放路径均为非级联迭代式，
-  #   # 深链不会栈溢出。
-  #   block_size: 512
-  #   # 统一评分权重：score = cache_weight·hit + load_weight·(1-load%)。
-  #   # 二者各自取 0.0..=1.0，且 cache_weight + load_weight ≤ 1.0（归一化）。
-  #   cache_weight: 0.7
-  #   load_weight: 0.3
   #   # trie 容量上限（块数），超出按 LRU 淘汰最久未访问的块。
   #   max_blocks: 500000
-  #   # 过载硬门控：inflight 负载 ≥ 此百分比容量的候选直接排除。100=禁用。
-  #   overload_threshold_pct: 90
   #   # TTL（秒）：自学习块无真实 evict 信号，到期由后台扫描删除。
-  #   # 0 = 禁用 TTL 扫描（只用 LRU 淘汰）；>0 = 秒数，后台每 ttl/2 扫一次。默认 1200。
+  #   # 0 = 禁用 TTL 扫描（只用 LRU 淘汰）；>0 = 秒数，后台扫描周期为
+  #   # min(ttl/2, 60s)。默认 1200。
   #   router_ttl_secs: 1200.0
 
   # 内容路由：根据请求内容自动选择模型（可选）

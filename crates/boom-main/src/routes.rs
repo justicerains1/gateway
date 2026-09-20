@@ -3762,13 +3762,8 @@ pub async fn kv_index_status(
     let kvc_cfg = &cfg.kvc_aware;
     let config_snapshot = serde_json::json!({
         "schedule_policy": cfg.schedule_policy,
-        "block_size": kvc_cfg.block_size,
         "max_blocks": kvc_cfg.max_blocks,
-        "cache_weight": kvc_cfg.cache_weight,
-        "tier_weight": 0.0, // removed (self-contained mode: all blocks Gpu)
-        "load_weight": kvc_cfg.load_weight,
         "router_ttl_secs": kvc_cfg.router_ttl_secs,
-        "overload_threshold_pct": kvc_cfg.overload_threshold_pct,
     });
 
     let kv_index_guard = state.kv_index.load();

@@ -4133,11 +4133,7 @@
         </summary>
         <p class="modal-hint">${t("config.tip.kvc_aware")}</p>
         <div class="form-card-grid">
-          ${fieldNum("cfg-kvc-block", t("config.field.block_size"), (r.kvc_aware || {}).block_size, { min: 1 })}
-          ${fieldNum("cfg-kvc-cache-w", t("config.field.cache_weight"), (r.kvc_aware || {}).cache_weight, { step: "0.05" })}
-          ${fieldNum("cfg-kvc-load-w", t("config.field.load_weight"), (r.kvc_aware || {}).load_weight, { step: "0.05" })}
           ${fieldNum("cfg-kvc-max-blocks", t("config.field.max_blocks"), (r.kvc_aware || {}).max_blocks, { min: 1 })}
-          ${fieldNum("cfg-kvc-overload", t("config.field.overload_threshold_pct"), (r.kvc_aware || {}).overload_threshold_pct, { min: 1, max: 100, step: 1 })}
           ${fieldNum("cfg-kvc-ttl", t("config.field.router_ttl_secs"), (r.kvc_aware || {}).router_ttl_secs, { min: 0, step: 1 })}
         </div>
       </details>
@@ -4584,11 +4580,7 @@
           // (its card shares this save button); auto_router has no editor and
           // is passed through verbatim.
           kvc_aware: {
-            block_size: numOr($("cfg-kvc-block"), 512),
-            cache_weight: numOr($("cfg-kvc-cache-w"), 0.7),
-            load_weight: numOr($("cfg-kvc-load-w"), 0.3),
             max_blocks: numOr($("cfg-kvc-max-blocks"), 500000),
-            overload_threshold_pct: numOr($("cfg-kvc-overload"), 90),
             router_ttl_secs: numOr($("cfg-kvc-ttl"), 1200),
           },
           auto_router: cfg.router_settings.auto_router ?? null,

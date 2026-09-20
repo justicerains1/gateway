@@ -857,12 +857,8 @@ curl -X PUT $BASE/dashboard/api/admin/config \
   -d '{
     "path":"router_settings.kvc_aware",
     "value":{
-      "block_size": 256,
-      "max_blocks": 4096,
-      "cache_weight": 0.5,
-      "load_weight": 0.5,
-      "router_ttl_secs": 300,
-      "overload_threshold_pct": 90
+      "max_blocks": 500000,
+      "router_ttl_secs": 300
     }
   }'
 ```

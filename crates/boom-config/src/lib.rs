@@ -671,32 +671,19 @@ impl RouterSettings {
 }
 
 /// Settings for KV-cache aware routing.
+///
+/// Deliberately minimal: the prefix trie's chunking granularity (block size
+/// 512B) is a code constant, not a knob — misconfigured tiny blocks (e.g. 1B)
+/// turn every request into ~100k trie nodes and fragment the allocator
+/// (observed: RSS pinned ~1.4G above live heap). Scoring is pure prefix
+/// affinity (hit_ratio); load balancing is handled by round-robin tie-breaks
+/// and the router-level rebalance_threshold, not by a weight here.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct KvcAwareSettings {
-    /// Block size in BYTES for the gateway-side prefix serialization chunking.
-    /// The request's serialized prefix (system+tools+messages) is sliced into
-    /// blocks of this many bytes; each block is xxhash3-64'd into a trie edge.
-    /// Default: 512 (≈ original 128-token granularity). The whole request
-    /// prefix is recorded (no per-request block cap), so chains grow to the
-    /// full context length; safe because all release paths are non-cascading.
-    #[serde(default = "default_block_size")]
-    pub block_size: usize,
-    /// Weight for cache hit score in combined scoring. Default: 0.7.
-    #[serde(default = "default_cache_weight")]
-    pub cache_weight: f64,
-    /// Weight for load score in combined scoring. Default: 0.3.
-    #[serde(default = "default_load_weight")]
-    pub load_weight: f64,
     /// Maximum number of indexed blocks across all models/workers.
     /// When exceeded, the least recently stored blocks are evicted. Default: 500,000.
     #[serde(default = "default_max_blocks")]
     pub max_blocks: usize,
-    /// Overload gate for kvc_aware routing: a candidate whose gateway-side
-    /// inflight load ≥ this percentage of its capacity is HARD-EXCLUDED from
-    /// selection (load_pct from inflight/capacity). 100 disables the gate.
-    /// Default: 90.
-    #[serde(default = "default_overload_threshold_pct")]
-    pub overload_threshold_pct: u64,
     /// TTL in seconds for approximate-mode blocks. The trie is self-learned
     /// (gateway records routed prefixes); without a real evict signal from
     /// vLLM, blocks expire by wall-clock to bound over-approximation. A
@@ -708,11 +695,7 @@ pub struct KvcAwareSettings {
 impl Default for KvcAwareSettings {
     fn default() -> Self {
         Self {
-            block_size: default_block_size(),
-            cache_weight: default_cache_weight(),
-            load_weight: default_load_weight(),
             max_blocks: default_max_blocks(),
-            overload_threshold_pct: default_overload_threshold_pct(),
             router_ttl_secs: default_router_ttl_secs(),
         }
     }
@@ -721,17 +704,6 @@ impl Default for KvcAwareSettings {
 impl KvcAwareSettings {
     /// Validate semantic constraints serde cannot enforce.
     pub fn validate(&self) -> Result<(), GatewayError> {
-        // overload_threshold_pct: 1..=100. 100 disables the overload gate;
-        // values >100 are silently a no-op (load_pct is capped at 100, so
-        // load_pct >= 150 is never true) — reject to avoid a misleading
-        // "configured but ineffective" state. 0 would hard-exclude every
-        // candidate (load_pct >= 0 always true), also rejected.
-        let otp = self.overload_threshold_pct;
-        if !(1..=100).contains(&otp) {
-            return Err(GatewayError::ConfigError(format!(
-                "router_settings.kvc_aware.overload_threshold_pct must be in 1..=100 (100 disables), got {otp}"
-            )));
-        }
         // router_ttl_secs: 0 disables the TTL prune task (LRU-only); >0 is the TTL in seconds.
         // Must be finite and non-negative: NaN and ±∞ are rejected — ∞ would panic
         // Duration::from_secs_f64 in spawn_kv_prune_task.
@@ -741,12 +713,6 @@ impl KvcAwareSettings {
                 self.router_ttl_secs
             )));
         }
-        // block_size: 0 makes the trie silently inert (n_full=0, no blocks hashed).
-        if self.block_size == 0 {
-            return Err(GatewayError::ConfigError(
-                "router_settings.kvc_aware.block_size must be > 0".to_string(),
-            ));
-        }
         // max_blocks: 0 triggers a silent fallback to 500_000 in LruCache::new; reject so
         // the configured value is honored (or the user learns it is invalid).
         if self.max_blocks == 0 {
@@ -754,51 +720,12 @@ impl KvcAwareSettings {
                 "router_settings.kvc_aware.max_blocks must be > 0".to_string(),
             ));
         }
-        // Weights are mixing coefficients in [0,1]. range.contains() returns false for NaN,
-        // so NaN is rejected here too.
-        if !(0.0..=1.0).contains(&self.cache_weight) {
-            return Err(GatewayError::ConfigError(format!(
-                "router_settings.kvc_aware.cache_weight must be in 0.0..=1.0, got {}",
-                self.cache_weight
-            )));
-        }
-        if !(0.0..=1.0).contains(&self.load_weight) {
-            return Err(GatewayError::ConfigError(format!(
-                "router_settings.kvc_aware.load_weight must be in 0.0..=1.0, got {}",
-                self.load_weight
-            )));
-        }
-        // score = cache_weight·hit + load_weight·load_avail is selected by max, so the sum
-        // isn't a mathematical requirement — but capping it at 1.0 keeps score normalized to
-        // [0,1] and matches the original weighted design (cw+lw+tw=1.0 before tier removal).
-        if self.cache_weight + self.load_weight > 1.0 {
-            return Err(GatewayError::ConfigError(format!(
-                "router_settings.kvc_aware.cache_weight + load_weight must be <= 1.0, got {}",
-                self.cache_weight + self.load_weight
-            )));
-        }
         Ok(())
     }
 }
 
-fn default_block_size() -> usize {
-    512
-}
-
 fn default_router_ttl_secs() -> f64 {
     1200.0
-}
-
-fn default_cache_weight() -> f64 {
-    0.7
-}
-
-fn default_overload_threshold_pct() -> u64 {
-    90
-}
-
-fn default_load_weight() -> f64 {
-    0.3
 }
 
 fn default_max_blocks() -> usize {
@@ -1386,7 +1313,7 @@ mod tests {
 
     #[test]
     fn test_validate_kvc_aware_params() {
-        // Defaults (block_size=512, max_blocks=500_000, cw=0.5, lw=0.2) pass.
+        // Defaults (max_blocks=500_000, ttl=1200) pass.
         let mut config: Config = serde_yaml::from_str("{}").unwrap();
         assert!(config.validate().is_ok(), "defaults should be valid");
 
@@ -1401,37 +1328,10 @@ mod tests {
         assert!(config.validate().is_err(), "infinite ttl should be rejected");
         config.router_settings.kvc_aware.router_ttl_secs = 120.0;
 
-        // block_size = 0 → reject (trie would be silently inert).
-        config.router_settings.kvc_aware.block_size = 0;
-        assert!(config.validate().is_err(), "block_size=0 should be rejected");
-        config.router_settings.kvc_aware.block_size = 512;
-
         // max_blocks = 0 → reject (silent 500_000 fallback otherwise).
         config.router_settings.kvc_aware.max_blocks = 0;
         assert!(config.validate().is_err(), "max_blocks=0 should be rejected");
         config.router_settings.kvc_aware.max_blocks = 500_000;
-
-        // cache_weight out of [0,1] → reject (NaN rejected too: contains() is false for NaN).
-        config.router_settings.kvc_aware.cache_weight = 1.5;
-        assert!(config.validate().is_err(), "cache_weight=1.5 should be rejected");
-        config.router_settings.kvc_aware.cache_weight = -0.1;
-        assert!(config.validate().is_err(), "negative cache_weight should be rejected");
-        config.router_settings.kvc_aware.cache_weight = f64::NAN;
-        assert!(config.validate().is_err(), "NaN cache_weight should be rejected");
-
-        // Boundary: cache_weight=1.0, load_weight=0.0 (sum=1.0) is valid.
-        config.router_settings.kvc_aware.cache_weight = 1.0;
-        config.router_settings.kvc_aware.load_weight = 0.0;
-        assert!(config.validate().is_ok(), "cw=1.0/lw=0.0 should be valid");
-
-        // sum > 1.0 → reject (normalization).
-        config.router_settings.kvc_aware.cache_weight = 0.5;
-        config.router_settings.kvc_aware.load_weight = 0.6;
-        assert!(config.validate().is_err(), "cw+lw>1.0 should be rejected");
-
-        // sum == 1.0 → valid.
-        config.router_settings.kvc_aware.load_weight = 0.5;
-        assert!(config.validate().is_ok(), "cw+lw==1.0 should be valid");
     }
 
     #[test]

@@ -1,5 +1,19 @@
 # KVC-Aware Routing 设计文档
 
+> **⚠️ 历史文档（第一代设计）**：本文描述的是早期的事件驱动方案（ZMQ 订阅 vLLM 块事件、
+> TokenizerPool 做 tokenize、cache/tier/load 三权重打分、`block_size` 等配置旋钮）。
+> 当前实现已完全取代该方案：
+>
+> - **自学习字节 trie**：不订阅 ZMQ、不 tokenize。前缀按 **512B 代码常量**（`KV_BLOCK_SIZE`，
+>   非配置项）切块 xxhash，路由后把前缀记到选中 worker 名下，下个相同前缀即命中。
+> - **纯前缀亲和打分**：`score = hit_ratio`，无负载项、无过载门；冷请求并列 0 分由
+>   round-robin 摊开，负载干预仅剩 router 级 `rebalance_threshold`。
+> - **配置面只剩两项**：`kvc_aware.max_blocks`（LRU 容量）与 `kvc_aware.router_ttl_secs`（TTL）。
+>   `block_size` / `cache_weight` / `tier_weight` / `load_weight` / `overload_threshold_pct`
+>   均已删除（残留 YAML 键被 serde 静默忽略）。
+>
+> 现状以 `CLAUDE.md` §7 与 `docs/software-design.md` F5.5/F5.6 为准；本文仅作设计演进参考。
+
 ## 概述
 
 KVC-Aware（KV-Cache Aware）路由通过 ZMQ 实时订阅 vLLM 推理引擎的 KV cache 块事件，构建 Token 前缀 Trie 索引。当新请求到达时，网关对请求消息做 Tokenize，在 Trie 中查找与已缓存 KV 前缀匹配度最高的 Worker，优先将请求路由到该 Worker，从而复用 KV cache、减少重复计算、降低首 Token 延迟（TTFT）。

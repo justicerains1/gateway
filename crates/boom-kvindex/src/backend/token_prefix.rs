@@ -89,9 +89,6 @@ pub struct TokenPrefixIndex {
     sweep_clock: std::time::Instant,
     last_sweep_ms: AtomicU64,
     block_size: usize,
-    cache_weight: f64,
-    #[allow(dead_code)]
-    load_weight: f64,
 }
 
 /// Minimum spacing between stale sweeps. Sweeps only unlink leaf nodes, so
@@ -120,7 +117,7 @@ fn chain_block_hash(parent_effective: u64, content_hash: u64) -> u64 {
 }
 
 impl TokenPrefixIndex {
-    pub fn new(block_size: usize, cache_weight: f64, load_weight: f64, max_blocks: usize) -> Self {
+    pub fn new(block_size: usize, max_blocks: usize) -> Self {
         let cap = NonZeroUsize::new(max_blocks).unwrap_or(NonZeroUsize::new(500_000).unwrap());
         Self {
             tries: DashMap::new(),
@@ -138,8 +135,6 @@ impl TokenPrefixIndex {
             // make every call return early (sweep never runs).
             last_sweep_ms: AtomicU64::new(u64::MAX),
             block_size,
-            cache_weight,
-            load_weight,
         }
     }
 
@@ -414,7 +409,9 @@ impl KvIndexBackend for TokenPrefixIndex {
                 total_blocks: total_blocks as u64,
                 hit_ratio,
                 load_score: 0.0,
-                combined_score: self.cache_weight * hit_ratio,
+                // Pure affinity signal: the policy scores on hit_ratio alone
+                // (load balancing is handled outside the index).
+                combined_score: hit_ratio,
             });
         }
         results.sort_by(|a, b| {
@@ -813,7 +810,7 @@ mod tests {
 
     #[test]
     fn test_single_root_block_match() {
-        let idx = TokenPrefixIndex::new(4, 0.5, 0.2, 500_000);
+        let idx = TokenPrefixIndex::new(4, 500_000);
         idx.apply_event(&store_event("m", "w0", 0, None, vec![1, 2, 3, 4]));
         let matches = idx.find_matches("m", &[1, 2, 3, 4], &["w0".to_string()]);
         assert_eq!(matches.len(), 1);
@@ -823,7 +820,7 @@ mod tests {
 
     #[test]
     fn test_chained_blocks_with_parent() {
-        let idx = TokenPrefixIndex::new(4, 0.5, 0.2, 500_000);
+        let idx = TokenPrefixIndex::new(4, 500_000);
         let b1 = vec![1, 2, 3, 4];
         let b2 = vec![5, 6, 7, 8];
         let b3 = vec![9, 10, 11, 12];
@@ -839,7 +836,7 @@ mod tests {
 
     #[test]
     fn test_multi_worker_prefix_reuse() {
-        let idx = TokenPrefixIndex::new(4, 0.5, 0.2, 500_000);
+        let idx = TokenPrefixIndex::new(4, 500_000);
         idx.apply_event(&store_event("m", "w0", 0, None, vec![1, 2, 3, 4]));
         idx.apply_event(&store_event("m", "w1", 0, None, vec![1, 2, 3, 4]));
         let m0 = idx.find_matches("m", &[1, 2, 3, 4], &["w0".to_string()]);
@@ -852,7 +849,7 @@ mod tests {
 
     #[test]
     fn test_evict_single_block() {
-        let idx = TokenPrefixIndex::new(4, 0.5, 0.2, 500_000);
+        let idx = TokenPrefixIndex::new(4, 500_000);
         // Use record_request_prefix for chain (reliable chain building)
         idx.record_request_prefix("m", "w0", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], StorageTier::Gpu);
         // Lookup key of block 2 is chain-scoped: chain(eff₁, content₂).
@@ -870,7 +867,7 @@ mod tests {
 
     #[test]
     fn test_remove_worker() {
-        let idx = TokenPrefixIndex::new(4, 0.5, 0.2, 500_000);
+        let idx = TokenPrefixIndex::new(4, 500_000);
         idx.apply_event(&store_event("m", "w0", 0, None, vec![1, 2, 3, 4]));
         idx.apply_event(&store_event("m2", "w0", 0, None, vec![10, 20, 30, 40]));
         idx.apply_event(&GatewayKvEvent::Remove {
@@ -885,7 +882,7 @@ mod tests {
 
     #[test]
     fn test_record_request_prefix_self_learning() {
-        let idx = TokenPrefixIndex::new(4, 0.5, 0.2, 500_000);
+        let idx = TokenPrefixIndex::new(4, 500_000);
         let prefix: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         idx.record_request_prefix("m", "w0", prefix, StorageTier::Gpu);
         let matches = idx.find_matches("m", prefix, &["w0".to_string()]);
@@ -897,7 +894,7 @@ mod tests {
 
     #[test]
     fn test_prune_expired_removes_old_blocks() {
-        let idx = TokenPrefixIndex::new(4, 0.5, 0.2, 500_000);
+        let idx = TokenPrefixIndex::new(4, 500_000);
         idx.record_request_prefix("m", "w0", &[1, 2, 3, 4], StorageTier::Gpu);
         assert!(idx.block_count() > 0);
         idx.prune_expired(std::time::Duration::ZERO);
@@ -907,7 +904,7 @@ mod tests {
     #[test]
     fn test_lru_capacity_limits_trie() {
         // max_blocks=4: inserting 8 blocks should evict the oldest 4
-        let idx = TokenPrefixIndex::new(4, 0.5, 0.2, 4);
+        let idx = TokenPrefixIndex::new(4, 4);
         for i in 0..8u64 {
             let chunk: Vec<u8> = vec![i as u8, i as u8, i as u8, i as u8];
             idx.apply_event(&store_event("m", "w0", 0, None, chunk));
@@ -938,7 +935,7 @@ mod tests {
             prefix.extend_from_slice(&b);
             prefix.resize(prefix.len() + block_size - b.len(), 0);
         }
-        let idx = TokenPrefixIndex::new(block_size, 0.5, 0.2, 1_000_000);
+        let idx = TokenPrefixIndex::new(block_size, 1_000_000);
         idx.record_request_prefix("m", "w0", &prefix, StorageTier::Gpu);
         assert_eq!(idx.block_count(), depth);
 
@@ -966,7 +963,7 @@ mod tests {
             prefix.extend_from_slice(&b);
             prefix.resize(prefix.len() + block_size - b.len(), 0);
         }
-        let idx = TokenPrefixIndex::new(block_size, 0.5, 0.2, 1_000_000);
+        let idx = TokenPrefixIndex::new(block_size, 1_000_000);
         idx.record_request_prefix("m", "w0", &prefix, StorageTier::Gpu);
         // Worker removal previously BFS'd the tree with write locks and
         // cascaded children.clear() — must now be lookup-driven, no cascade.
@@ -978,7 +975,7 @@ mod tests {
 
     #[test]
     fn test_sweep_reclaims_empty_shells() {
-        let idx = TokenPrefixIndex::new(4, 0.5, 0.2, 1_000_000);
+        let idx = TokenPrefixIndex::new(4, 1_000_000);
         idx.record_request_prefix("m", "w0", &[1, 2, 3, 4, 5, 6, 7, 8], StorageTier::Gpu);
         assert_eq!(idx.block_count(), 2);
         // root + 2 block nodes.
@@ -1043,7 +1040,7 @@ mod tests {
         // forever and sweep_stale can never unlink it (gate requires empty
         // workers). Observed in production as trie_blocks=0 with 561k nodes
         // stuck after TTL expiry.
-        let idx = TokenPrefixIndex::new(4, 0.5, 0.2, 1_000_000);
+        let idx = TokenPrefixIndex::new(4, 1_000_000);
         // Prefix: A, B, A — block A content appears at depth 1 AND depth 3.
         idx.record_request_prefix("m", "w0", &[1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4], StorageTier::Gpu);
         // root + A1 + B + A2 = 4 nodes; with chain-scoped lookup keys all
@@ -1067,7 +1064,7 @@ mod tests {
 
     #[test]
     fn test_block_count_tracks_insert_and_evict() {
-        let idx = TokenPrefixIndex::new(4, 0.5, 0.2, 1_000_000);
+        let idx = TokenPrefixIndex::new(4, 1_000_000);
         idx.record_request_prefix("m", "w0", &[1, 2, 3, 4, 5, 6, 7, 8], StorageTier::Gpu);
         assert_eq!(idx.block_count(), 2);
         // Re-recording the same prefix must not double-count.

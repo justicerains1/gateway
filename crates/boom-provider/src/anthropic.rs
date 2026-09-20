@@ -23,6 +23,7 @@ pub struct AnthropicProvider {
     kv_worker_id: Option<String>,
     api_version: String,
     client_type_header: bool,
+    custom_headers: Vec<(String, String)>,
 }
 
 impl AnthropicProvider {
@@ -45,11 +46,17 @@ impl AnthropicProvider {
             kv_worker_id,
             api_version: "2023-06-01".to_string(),
             client_type_header,
+            custom_headers: Vec::new(),
         }
     }
 
     pub fn with_api_version(mut self, version: String) -> Self {
         self.api_version = version;
+        self
+    }
+
+    pub fn with_custom_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.custom_headers = headers;
         self
     }
 
@@ -546,9 +553,7 @@ impl Provider for AnthropicProvider {
         if !betas.is_empty() {
             builder = builder.header("anthropic-beta", betas.join(","));
         }
-        for (name, value) in &gateway_headers {
-            builder = builder.header(name, value);
-        }
+        builder = crate::apply_gateway_headers(builder, &gateway_headers);
         // Non-streaming: upstream sends no data until the entire response is ready.
         // Uses the reqwest Client timeout from deployment config (`create_provider`), not a separate 600s cap.
 
@@ -600,9 +605,7 @@ impl Provider for AnthropicProvider {
         if !betas.is_empty() {
             builder = builder.header("anthropic-beta", betas.join(","));
         }
-        for (name, value) in &gateway_headers {
-            builder = builder.header(name, value);
-        }
+        builder = crate::apply_gateway_headers(builder, &gateway_headers);
 
         let resp = builder
             .json(&body)
@@ -936,6 +939,10 @@ impl Provider for AnthropicProvider {
 
     fn client_type_header(&self) -> bool {
         self.client_type_header
+    }
+
+    fn custom_headers(&self) -> &[(String, String)] {
+        &self.custom_headers
     }
 }
 

@@ -17,6 +17,7 @@ pub struct GeminiProvider {
     model: String,
     deployment_id: Option<String>,
     client_type_header: bool,
+    custom_headers: Vec<(String, String)>,
 }
 
 impl GeminiProvider {
@@ -27,7 +28,13 @@ impl GeminiProvider {
             model: model.to_string(),
             deployment_id,
             client_type_header,
+            custom_headers: Vec::new(),
         }
+    }
+
+    pub fn with_custom_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.custom_headers = headers;
+        self
     }
 
     /// Convert to Gemini's generateContent format.
@@ -327,9 +334,7 @@ impl Provider for GeminiProvider {
         if let Some(ref key) = self.api_key {
             builder = builder.query(&[("key", key)]);
         }
-        for (name, value) in &gateway_headers {
-            builder = builder.header(name, value);
-        }
+        builder = crate::apply_gateway_headers(builder, &gateway_headers);
         // Non-streaming: upstream sends no data until the entire response is ready.
         // Uses the reqwest Client timeout from deployment config (`create_provider`), not a separate 600s cap.
 
@@ -375,9 +380,7 @@ impl Provider for GeminiProvider {
         if let Some(ref key) = self.api_key {
             builder = builder.query(&[("key", key)]);
         }
-        for (name, value) in &gateway_headers {
-            builder = builder.header(name, value);
-        }
+        builder = crate::apply_gateway_headers(builder, &gateway_headers);
 
         let resp = builder
             .json(&body)
@@ -600,5 +603,9 @@ impl Provider for GeminiProvider {
 
     fn client_type_header(&self) -> bool {
         self.client_type_header
+    }
+
+    fn custom_headers(&self) -> &[(String, String)] {
+        &self.custom_headers
     }
 }

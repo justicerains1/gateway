@@ -670,14 +670,15 @@ pub async fn auto_enable_deployment(state: &AppState, deployment_id: &str) {
 
 /// Build a Provider from a DB deployment row (from DeploymentStore::load_model_rows).
 fn build_provider_from_row(row: &boom_routing::DeploymentProviderRow) -> Option<Arc<dyn Provider>> {
-    let mut extra = HashMap::new();
+    let mut custom_headers = HashMap::new();
     if let Some(obj) = row.headers.as_object() {
         for (k, v) in obj {
             if let Some(s) = v.as_str() {
-                extra.insert(k.clone(), s.to_string());
+                custom_headers.insert(k.clone(), s.to_string());
             }
         }
     }
+    let mut extra = HashMap::new();
     if let Some(ref v) = row.api_version {
         extra.insert("api_version".to_string(), v.clone());
     }
@@ -699,6 +700,7 @@ fn build_provider_from_row(row: &boom_routing::DeploymentProviderRow) -> Option<
         row.api_base.clone(),
         row.timeout as u64,
         &extra,
+        &custom_headers,
         row.deployment_id.clone(),
         row.client_type_header.unwrap_or(false),
     ) {

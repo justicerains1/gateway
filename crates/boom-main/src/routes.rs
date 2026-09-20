@@ -807,13 +807,14 @@ async fn chat_completions_inner(
         }
     }
 
-    // Attach gateway-internal headers (e.g. X-Gateway-Priority) plus the
-    // client-whitelisted headers. The compose function injects client
-    // whitelist first, gateway-controlled values second (overriding any
-    // same-named client entry — clients cannot spoof VIP priority).
+    // Attach gateway-internal headers (e.g. X-Gateway-Priority), the
+    // deployment's custom headers, plus the client-whitelisted headers.
+    // Compose priority: gateway-injected > deployment custom > client
+    // whitelist (clients cannot spoof VIP priority).
     req.gateway_headers = compose_gateway_headers(
         headers,
         &inner.config.router_settings.forward_client_headers,
+        provider.custom_headers(),
         is_vip,
         inner.config.router_settings.enable_priority_header,
         api_path,
@@ -834,31 +835,19 @@ async fn chat_completions_inner(
                 g.child_parent_span_id(),
                 w3c.sampled,
             );
-            req.gateway_headers.insert(
-                "traceparent".to_string(),
-                child_tp,
-            );
+            insert_header_ci(&mut req.gateway_headers, "traceparent", child_tp);
             if !w3c.trace_state.is_empty() {
-                req.gateway_headers.insert(
-                    "tracestate".to_string(),
-                    w3c.trace_state.clone(),
-                );
+                insert_header_ci(&mut req.gateway_headers, "tracestate", w3c.trace_state.clone());
             }
         } else if trace_cfg.propagate_only {
             // Trace channel off but propagate_only=true: forward the inbound
             // traceparent unchanged. Read back the raw header value we
             // already parsed.
             if let Some(raw) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
-                req.gateway_headers.insert(
-                    "traceparent".to_string(),
-                    raw.to_string(),
-                );
+                insert_header_ci(&mut req.gateway_headers, "traceparent", raw.to_string());
             }
             if let Some(raw) = headers.get("tracestate").and_then(|v| v.to_str().ok()) {
-                req.gateway_headers.insert(
-                    "tracestate".to_string(),
-                    raw.to_string(),
-                );
+                insert_header_ci(&mut req.gateway_headers, "tracestate", raw.to_string());
             }
         }
     }
@@ -2035,21 +2024,22 @@ fn build_gateway_headers(
 }
 
 /// Filter client `HeaderMap` through a whitelist of header names. Returns
-/// a lowercased-keyed map of permitted, non-blocked client headers — the
-/// first half of the `req.gateway_headers` side-channel.
+/// the permitted, non-blocked client headers — the first pass of the
+/// `req.gateway_headers` side-channel.
 ///
 /// Empty whitelist = forward nothing (default-deny, matching historical
 /// behavior where the gateway rewrites every upstream header itself).
 ///
-/// Hard-blocked names/prefixes — dropped even when listed in the whitelist:
-/// - `x-gateway-*`, `x-boom-*` — gateway-controlled, must not be spoofable
-/// - `authorization`, `x-api-key`, `api-key` — provider re-injects from
-///   deployment config (the whole point of the gateway)
-/// - `cookie`, `set-cookie` — RFC 6265代理剥离, prevents session leakage
-/// - `surrogate-key` — gateway routes KV-cache by `key_hash`, never client
+/// Hard-blocked names/prefixes — see `boom_core::is_hard_blocked_header`
+/// (single source of truth, shared with the deployment custom header
+/// sanitizer).
 ///
-/// Header name matching is case-insensitive (RFC 7230 §3.2): whitelist
-/// entries and incoming names are both lowercased before comparison.
+/// Header name matching is case-insensitive (RFC 9110 §5.1): incoming names
+/// arrive pre-lowercased by the `http` crate, so only the whitelist entries
+/// need normalization for comparison. Output keys keep the whitelist entry's
+/// original spelling (e.g. `X-Request-Id`) — the client's wire-case is
+/// already lost at inbound parse, and the whitelist spelling is the only
+/// case the operator controls end-to-end through the gateway.
 fn forward_client_headers(
     client_headers: &axum::http::HeaderMap,
     whitelist: &[String],
@@ -2058,60 +2048,67 @@ fn forward_client_headers(
     if whitelist.is_empty() {
         return out;
     }
-    let wl: std::collections::HashSet<&str> = whitelist.iter().map(|s| s.as_str()).collect();
+    let wl: std::collections::HashMap<String, &str> = whitelist
+        .iter()
+        .map(|s| (s.to_lowercase(), s.as_str()))
+        .collect();
     for (name, value) in client_headers.iter() {
         let lower = name.as_str().to_lowercase();
-        if lower.starts_with("x-gateway-")
-            || lower.starts_with("x-boom-")
-            || lower == "authorization"
-            || lower == "x-api-key"
-            || lower == "api-key"
-            || lower == "cookie"
-            || lower == "set-cookie"
-            || lower == "surrogate-key"
-        {
+        if boom_core::is_hard_blocked_header(&lower) {
             continue;
         }
-        if !wl.contains(lower.as_str()) {
-            continue;
-        }
-        if let Ok(v) = value.to_str() {
-            out.insert(lower, v.to_string());
+        if let Some(&orig) = wl.get(lower.as_str()) {
+            if let Ok(v) = value.to_str() {
+                out.insert(orig.to_string(), v.to_string());
+            }
         }
     }
     out
 }
 
-/// Compose the full upstream-header side-channel: client whitelist pass
-/// first, gateway-injected values second (overriding any same-named
-/// client entry). Centralizing the merge keeps the override order
-/// consistent across the OpenAI and Anthropic paths.
+/// Insert into the upstream-header map, replacing any existing entry for
+/// the same logical (case-insensitive) header name. Map keys keep their
+/// original spelling, so a plain `HashMap::insert` would silently miss a
+/// differently-cased twin and the provider layer would send both values.
+fn insert_header_ci(map: &mut std::collections::HashMap<String, String>, name: &str, value: String) {
+    let lower = name.to_lowercase();
+    map.retain(|k, _| k.to_lowercase() != lower);
+    map.insert(name.to_string(), value);
+}
+
+/// Compose the full upstream-header side-channel in fixed priority order:
+/// client whitelist pass first, deployment custom headers second,
+/// gateway-injected values last (highest priority). Centralizing the merge
+/// keeps the override order consistent across the OpenAI and Anthropic
+/// paths.
 ///
-/// Both passes normalize keys to lowercase before inserting into the map —
-/// HTTP header names are case-insensitive (RFC 7230 §3.2), and using a
-/// single canonical case means the gateway-injected value reliably
-/// overrides any client-supplied value of the same name (e.g. a client
-/// cannot spoof `x-gateway-priority` because the gateway inserts the
-/// same lowercase key after the client pass).
+/// Keys keep their original spelling; override semantics are
+/// case-insensitive via `insert_header_ci` — a client cannot spoof
+/// `x-gateway-priority` because the gateway's entry replaces any
+/// same-named client entry regardless of spelling.
 fn compose_gateway_headers(
     client_headers: &axum::http::HeaderMap,
     whitelist: &[String],
+    custom: &[(String, String)],
     is_vip: bool,
     enable_priority_header: bool,
     api_path: &str,
     client_type_enabled: bool,
 ) -> std::collections::HashMap<String, String> {
     let mut headers = forward_client_headers(client_headers, whitelist);
+    // Deployment-level custom headers override the client pass but stay
+    // below gateway-injected values. Already sanitized at provider creation
+    // (reserved keys, hard-blocked and transport-critical names dropped).
+    for (k, v) in custom {
+        insert_header_ci(&mut headers, k, v.clone());
+    }
     for (k, v) in build_gateway_headers(
         is_vip,
         enable_priority_header,
         api_path,
         client_type_enabled,
     ) {
-        // Lowercase the key so gateway-injected entries override any
-        // same-named client entry already in the map (which was inserted
-        // under its lowercased name).
-        headers.insert(k.to_lowercase(), v);
+        insert_header_ci(&mut headers, &k, v);
     }
     headers
 }
@@ -3107,13 +3104,14 @@ pub async fn messages(
         }
     }
 
-    // Attach gateway-internal headers (e.g. X-Gateway-Priority) plus the
-    // client-whitelisted headers. compose injects client whitelist first,
-    // gateway-controlled values second (overriding any same-named client
-    // entry — clients cannot spoof VIP priority). `/v1/messages` path.
+    // Attach gateway-internal headers (e.g. X-Gateway-Priority), the
+    // deployment's custom headers, plus the client-whitelisted headers.
+    // Compose priority: gateway-injected > deployment custom > client
+    // whitelist. `/v1/messages` path.
     openai_req.gateway_headers = compose_gateway_headers(
         &headers,
         &inner.config.router_settings.forward_client_headers,
+        provider.custom_headers(),
         is_vip,
         inner.config.router_settings.enable_priority_header,
         "/v1/messages",
@@ -3128,28 +3126,16 @@ pub async fn messages(
                 g.child_parent_span_id(),
                 w3c.sampled,
             );
-            openai_req.gateway_headers.insert(
-                "traceparent".to_string(),
-                child_tp,
-            );
+            insert_header_ci(&mut openai_req.gateway_headers, "traceparent", child_tp);
             if !w3c.trace_state.is_empty() {
-                openai_req.gateway_headers.insert(
-                    "tracestate".to_string(),
-                    w3c.trace_state.clone(),
-                );
+                insert_header_ci(&mut openai_req.gateway_headers, "tracestate", w3c.trace_state.clone());
             }
         } else if trace_cfg.propagate_only {
             if let Some(raw) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
-                openai_req.gateway_headers.insert(
-                    "traceparent".to_string(),
-                    raw.to_string(),
-                );
+                insert_header_ci(&mut openai_req.gateway_headers, "traceparent", raw.to_string());
             }
             if let Some(raw) = headers.get("tracestate").and_then(|v| v.to_str().ok()) {
-                openai_req.gateway_headers.insert(
-                    "tracestate".to_string(),
-                    raw.to_string(),
-                );
+                insert_header_ci(&mut openai_req.gateway_headers, "tracestate", raw.to_string());
             }
         }
     }
@@ -3831,7 +3817,7 @@ pub async fn kv_index_status(
 mod tests {
     use super::{
         build_gateway_headers, compose_gateway_headers, done_sse_item,
-        forward_client_headers, is_vip_key, preferred_stream_usage,
+        forward_client_headers, insert_header_ci, is_vip_key, preferred_stream_usage,
         sse_stream_from_chat_stream, UsageTracker, UsageTrackerState,
     };
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
@@ -3976,6 +3962,23 @@ mod tests {
     }
 
     #[test]
+    fn forward_client_headers_mixed_case_whitelist_entry_matches_and_preserves_spelling() {
+        // Whitelist entry carries uppercase letters — must still match the
+        // (pre-lowercased) incoming name, and the forwarded key keeps the
+        // whitelist spelling. Regression: entries used verbatim never
+        // matched, silently dropping the header.
+        let client = header_map(&[
+            ("x-request-id", "req-123"),
+            ("X-Custom-Header", "abc"),
+        ]);
+        let wl = vec!["X-Request-Id".to_string(), "x-custom-header".to_string()];
+        let out = forward_client_headers(&client, &wl);
+        assert_eq!(out.get("X-Request-Id").map(String::as_str), Some("req-123"));
+        assert_eq!(out.get("x-custom-header").map(String::as_str), Some("abc"));
+        assert_eq!(out.len(), 2, "both whitelisted headers must be forwarded");
+    }
+
+    #[test]
     fn forward_client_headers_blocks_gateway_controlled_prefix() {
         // Even when listed in the whitelist, x-gateway-* must be hard-dropped
         // so clients cannot spoof VIP priority.
@@ -4018,36 +4021,85 @@ mod tests {
 
     #[test]
     fn compose_gateway_headers_injects_gateway_value_overriding_client() {
-        // Client whitelists `x-gateway-priority` (will be hard-blocked in the
-        // client pass) and `user-agent` (forwarded). The gateway then
-        // injects its own `x-gateway-priority: 0`, which must be present
-        // and override any (blocked) client attempt.
+        // Client whitelists `X-Gateway-Priority` (mixed case — will be
+        // hard-blocked in the client pass) and `user-agent` (forwarded).
+        // The gateway then injects its own `X-Gateway-Priority: 0`, which
+        // must be present and override any (blocked) client attempt.
         let client = header_map(&[
             ("user-agent", "my-app/1.0"),
             ("x-gateway-priority", "100"), // client attempts to spoof VIP
         ]);
         let wl = vec![
             "user-agent".to_string(),
-            "x-gateway-priority".to_string(),
+            "X-Gateway-Priority".to_string(),
         ];
         let out = compose_gateway_headers(
             &client,
             &wl,
+            /* custom */ &[],
             /* is_vip */ false,
             /* enable_priority_header */ true,
             "/v1/chat/completions",
             /* client_type_enabled */ false,
         );
-        // Client UA forwarded (lowercase key).
+        // Client UA forwarded under the whitelist entry's spelling.
         assert_eq!(out.get("user-agent").map(String::as_str), Some("my-app/1.0"));
-        // Gateway value overrides — keys are lowercased so the gateway
-        // entry lives under the same key the client pass would have used.
+        // Gateway value wins over the client spoof attempt, under the
+        // gateway-emitted spelling, with no case-variant duplicate left over.
         assert_eq!(
-            out.get("x-gateway-priority").map(String::as_str),
+            out.get("X-Gateway-Priority").map(String::as_str),
             Some("0"),
             "gateway-injected value must win over client spoof attempt"
         );
+        assert!(
+            !out.contains_key("x-gateway-priority"),
+            "no lowercase twin may remain alongside the injected entry"
+        );
         assert_eq!(out.len(), 2, "only UA and priority should be in the map");
+    }
+
+    #[test]
+    fn insert_header_ci_replaces_case_variant_twin() {
+        // Post-compose injections (traceparent/tracestate) must replace a
+        // whitelisted client entry even when the spellings differ in case —
+        // otherwise the provider layer would send both values upstream.
+        let mut map = std::collections::HashMap::new();
+        map.insert("Traceparent".to_string(), "client-value".to_string());
+        insert_header_ci(&mut map, "traceparent", "gateway-value".to_string());
+        assert_eq!(map.len(), 1, "case-variant twin must be replaced, not duplicated");
+        assert_eq!(map.get("traceparent").map(String::as_str), Some("gateway-value"));
+    }
+
+    #[test]
+    fn compose_gateway_headers_custom_layer_priority() {
+        // Fixed priority: gateway-injected > deployment custom > client
+        // whitelist. Here the client pass and the deployment custom pass
+        // claim `x-shared` (spelled differently per source — overrides are
+        // case-insensitive); gateway-injected names can never collide with
+        // custom entries because the creation-time sanitizer drops them.
+        let client = header_map(&[("x-shared", "client")]);
+        let wl = vec!["x-shared".to_string()];
+        let custom = vec![
+            ("X-Shared".to_string(), "deployment".to_string()),
+            ("X-Deploy-Only".to_string(), "yes".to_string()),
+        ];
+        let out = compose_gateway_headers(
+            &client,
+            &wl,
+            &custom,
+            /* is_vip */ false,
+            /* enable_priority_header */ true,
+            "/v1/chat/completions",
+            /* client_type_enabled */ false,
+        );
+        // Deployment custom beat the client pass under its own spelling.
+        assert_eq!(out.get("X-Shared").map(String::as_str), Some("deployment"));
+        assert!(!out.contains_key("x-shared"), "client-spelled twin must not remain");
+        // Deployment-only header passes through untouched.
+        assert_eq!(out.get("X-Deploy-Only").map(String::as_str), Some("yes"));
+        // Gateway-injected priority is present alongside.
+        assert_eq!(out.get("X-Gateway-Priority").map(String::as_str), Some("0"));
+        assert_eq!(out.len(), 3);
     }
 
     #[test]

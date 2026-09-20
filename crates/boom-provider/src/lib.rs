@@ -11,6 +11,99 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Keys inside `litellm_params.headers` that historically doubled as provider
+/// config knobs (the headers map used to be merged into the `extra` param
+/// namespace). They keep their config meaning and are never sent as headers.
+const RESERVED_PARAM_KEYS: &[&str] = &["api_version", "aws_region_name", "anthropic_version"];
+
+/// Transport/framing headers a deployment must not override — customizing
+/// these breaks request serialization or response parsing (JSON body,
+/// chunked SSE).
+const TRANSPORT_CRITICAL_HEADERS: &[&str] = &[
+    "content-type",
+    "content-length",
+    "host",
+    "connection",
+    "transfer-encoding",
+    "accept",
+    "accept-encoding",
+    "te",
+    "upgrade",
+    "expect",
+];
+
+/// Filter a deployment's `litellm_params.headers` down to the entries that
+/// may actually be attached to upstream requests. Drops (with a warn, once
+/// at provider creation — zero per-request cost):
+/// - reserved config keys (`api_version`, …) — config semantics, not headers
+/// - spoof/auth hard-blocked names — see `boom_core::is_hard_blocked_header`
+/// - transport-critical names (content-type, …)
+/// - syntactically invalid header names/values
+fn sanitize_custom_headers(
+    provider_type: &str,
+    headers: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (name, value) in headers {
+        let lower = name.to_lowercase();
+        if RESERVED_PARAM_KEYS.contains(&name.as_str()) {
+            continue;
+        }
+        if boom_core::is_hard_blocked_header(&lower) {
+            tracing::warn!(
+                provider = provider_type,
+                header = %name,
+                "dropping deployment custom header: name is hard-blocked by gateway policy"
+            );
+            continue;
+        }
+        if TRANSPORT_CRITICAL_HEADERS.contains(&lower.as_str()) {
+            tracing::warn!(
+                provider = provider_type,
+                header = %name,
+                "dropping deployment custom header: transport-critical name"
+            );
+            continue;
+        }
+        let name_ok = reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_ok();
+        let value_ok = reqwest::header::HeaderValue::from_str(value).is_ok();
+        if !name_ok || !value_ok {
+            tracing::warn!(
+                provider = provider_type,
+                header = %name,
+                "dropping deployment custom header: invalid name or value"
+            );
+            continue;
+        }
+        out.push((name.clone(), value.clone()));
+    }
+    out
+}
+
+/// Apply the merged upstream-header side channel (`gateway_headers`) in one
+/// shot. `RequestBuilder::headers` replaces same-named entries the provider
+/// already set, so a deployment custom header can deliberately override a
+/// provider default (e.g. `anthropic-beta`) without producing duplicate
+/// values — the per-entry `RequestBuilder::header` appends and would.
+pub(crate) fn apply_gateway_headers(
+    builder: reqwest::RequestBuilder,
+    headers: &HashMap<String, String>,
+) -> reqwest::RequestBuilder {
+    let mut map = reqwest::header::HeaderMap::new();
+    for (name, value) in headers {
+        match (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(value),
+        ) {
+            (Ok(n), Ok(v)) => {
+                map.insert(n, v);
+            }
+            _ => tracing::warn!(header = %name, "dropping invalid upstream header entry"),
+        }
+    }
+    builder.headers(map)
+}
+
 /// Create a provider instance from litellm-style config params.
 ///
 /// `model` follows litellm's `provider/model-id` convention:
@@ -18,12 +111,17 @@ use std::sync::Arc;
 ///   - `gpt-4` → auto-detected as openai, model=gpt-4
 ///   - `anthropic/claude-sonnet-4-20250514` → provider=anthropic
 ///   - `hosted_vllm/my-model` → OpenAI-compatible provider
+///
+/// `extra` carries provider config params (`api_version`, `aws_region_name`);
+/// `custom_headers` carries the deployment's `litellm_params.headers` map,
+/// sanitized here into headers actually attached to every upstream request.
 pub fn create_provider(
     model: &str,
     api_key: Option<String>,
     api_base: Option<String>,
     timeout: u64,
     extra: &HashMap<String, String>,
+    custom_headers: &HashMap<String, String>,
     deployment_id: Option<String>,
     client_type_header: bool,
 ) -> Result<Arc<dyn Provider>, GatewayError> {
@@ -33,6 +131,18 @@ pub fn create_provider(
         .map_err(|e| GatewayError::ConfigError(format!("Failed to create HTTP client: {}", e)))?;
 
     let (provider_type, actual_model) = parse_model_provider(model);
+
+    // Backward compatibility: reserved keys configured inside the headers
+    // map used to reach `extra` through namespace merging and act as
+    // provider config; keep honoring them, with typed fields (already in
+    // `extra`) taking precedence.
+    let mut merged_extra = extra.clone();
+    for (k, v) in custom_headers {
+        if RESERVED_PARAM_KEYS.contains(&k.as_str()) {
+            merged_extra.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    let attached = sanitize_custom_headers(provider_type, custom_headers);
 
     match provider_type {
         // All OpenAI-compatible providers share the same API format.
@@ -71,14 +181,17 @@ pub fn create_provider(
                     None
                 }
             });
-            Ok(Arc::new(openai::OpenAIProvider::new(
-                client,
-                key,
-                api_base,
-                &actual_model,
-                deployment_id,
-                client_type_header,
-            )))
+            Ok(Arc::new(
+                openai::OpenAIProvider::new(
+                    client,
+                    key,
+                    api_base,
+                    &actual_model,
+                    deployment_id,
+                    client_type_header,
+                )
+                .with_custom_headers(attached),
+            ))
         }
         "anthropic" => {
             let mut provider = anthropic::AnthropicProvider::new(
@@ -88,14 +201,15 @@ pub fn create_provider(
                 &actual_model,
                 deployment_id,
                 client_type_header,
-            );
-            if let Some(version) = extra.get("anthropic_version") {
+            )
+            .with_custom_headers(attached);
+            if let Some(version) = merged_extra.get("anthropic_version") {
                 provider = provider.with_api_version(version.clone());
             }
             Ok(Arc::new(provider))
         }
         "azure" => {
-            let api_version = extra.get("api_version").cloned().unwrap_or_default();
+            let api_version = merged_extra.get("api_version").cloned().unwrap_or_default();
             Ok(Arc::new(azure::AzureProvider::new(
                 client,
                 api_key,
@@ -104,7 +218,8 @@ pub fn create_provider(
                 &api_version,
                 deployment_id,
                 client_type_header,
-            )))
+            )
+            .with_custom_headers(attached)))
         }
         "gemini" => Ok(Arc::new(gemini::GeminiProvider::new(
             client,
@@ -112,9 +227,10 @@ pub fn create_provider(
             &actual_model,
             deployment_id,
             client_type_header,
-        ))),
+        )
+        .with_custom_headers(attached))),
         "bedrock" => {
-            let region = extra
+            let region = merged_extra
                 .get("aws_region_name")
                 .cloned()
                 .unwrap_or_else(|| "us-east-1".to_string());
@@ -212,7 +328,7 @@ pub(crate) fn now_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::create_provider;
-    use boom_core::provider::ProviderProtocol;
+    use boom_core::provider::{Provider, ProviderProtocol};
     use std::collections::HashMap;
 
     #[test]
@@ -223,6 +339,7 @@ mod tests {
                 Some("test-key".to_string()),
                 Some("http://127.0.0.1:1/v1".to_string()),
                 1,
+                &HashMap::new(),
                 &HashMap::new(),
                 None,
                 false,
@@ -244,5 +361,60 @@ mod tests {
         ] {
             assert_eq!(create(model).protocol(), ProviderProtocol::Native);
         }
+    }
+
+    #[test]
+    fn custom_headers_survive_sanitization_and_attach_to_provider() {
+        let mut headers = HashMap::new();
+        headers.insert("X-Request-Id".to_string(), "deploy-1".to_string());
+        // Reserved config key → config semantics, never sent as header.
+        headers.insert("api_version".to_string(), "2024-02-01".to_string());
+        // Hard-blocked → dropped.
+        headers.insert("x-gateway-priority".to_string(), "spoof".to_string());
+        headers.insert("Authorization".to_string(), "Bearer leak".to_string());
+        // Transport-critical → dropped.
+        headers.insert("content-type".to_string(), "text/plain".to_string());
+        // Invalid header name (space) → dropped.
+        headers.insert("bad name".to_string(), "x".to_string());
+
+        let provider = create_provider(
+            "openai/test-model",
+            Some("test-key".to_string()),
+            Some("http://127.0.0.1:1/v1".to_string()),
+            1,
+            &HashMap::new(),
+            &headers,
+            None,
+            false,
+        )
+        .unwrap();
+        let attached = provider.custom_headers();
+        assert_eq!(attached.len(), 1, "only the ordinary header survives");
+        assert_eq!(attached[0].0, "X-Request-Id");
+        assert_eq!(attached[0].1, "deploy-1");
+    }
+
+    #[test]
+    fn reserved_key_in_headers_map_still_configures_provider() {
+        // Backward compat: anthropic_version inside the headers map keeps
+        // its historical config meaning (never sent as a header).
+        let mut headers = HashMap::new();
+        headers.insert("anthropic_version".to_string(), "2023-01-01".to_string());
+
+        let provider = create_provider(
+            "anthropic/test-model",
+            None,
+            Some("http://127.0.0.1:1".to_string()),
+            1,
+            &HashMap::new(),
+            &headers,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            provider.custom_headers().is_empty(),
+            "reserved key must not become an upstream header"
+        );
     }
 }

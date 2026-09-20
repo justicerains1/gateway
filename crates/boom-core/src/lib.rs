@@ -18,6 +18,7 @@ pub use error::GatewayError;
 pub use key_format::is_valid_prefix;
 pub use kv_event::KvIndexBackend;
 pub use otlp_config::OtlpConfig;
+pub use types::is_hard_blocked_header;
 pub use provider::{Authenticator, DeploymentQueueInfo, KeyAliasLookup, Provider};
 pub use stressmon::{StressmonApi, StressmonSample, StressmonSnapshot};
 pub use trace::{

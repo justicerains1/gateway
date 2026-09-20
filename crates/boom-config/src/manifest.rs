@@ -111,7 +111,10 @@ pub fn general_settings_fields() -> &'static [FieldMeta] {
 
 /// Manifest for `router_settings.*` editable from the dashboard config page.
 /// Excludes the `kvc_aware` sub-tree (it has its own card) and `model_group_alias`
-/// (free-form JSON textarea, no per-field schema).
+/// (managed via the Models page alias CRUD — DB + AdminCommand, not the config
+/// editor). Fields marked `section: "general"` are surfaced on the General card
+/// but still live under `router_settings` in YAML — the frontend saves them
+/// via dotted sub-paths (`router_settings.<field>`).
 pub fn router_settings_fields() -> &'static [FieldMeta] {
     &[
         FieldMeta { field: "schedule_policy", section: "router", input_type: "select",
@@ -120,13 +123,13 @@ pub fn router_settings_fields() -> &'static [FieldMeta] {
                     label_key: "config.field.affinity_context_threshold", tip_key: "tip.config.affinity_context_threshold" },
         FieldMeta { field: "rebalance_threshold", section: "router", input_type: "number",
                     label_key: "config.field.rebalance_threshold", tip_key: "tip.config.rebalance_threshold" },
-        FieldMeta { field: "enable_priority_header", section: "router", input_type: "bool",
+        FieldMeta { field: "enable_priority_header", section: "general", input_type: "bool",
                     label_key: "config.field.enable_priority_header", tip_key: "tip.config.enable_priority_header" },
         FieldMeta { field: "flow_control_queue_timeout_secs", section: "router", input_type: "number",
                     label_key: "config.field.flow_control_queue_timeout_secs", tip_key: "tip.config.flow_control_queue_timeout_secs" },
-        FieldMeta { field: "strip_claude_code_attribution", section: "router", input_type: "bool",
+        FieldMeta { field: "strip_claude_code_attribution", section: "general", input_type: "bool",
                     label_key: "config.field.strip_claude_code_attribution", tip_key: "tip.config.strip_claude_code_attribution" },
-        FieldMeta { field: "forward_client_headers", section: "router", input_type: "list",
+        FieldMeta { field: "forward_client_headers", section: "general", input_type: "list",
                     label_key: "config.field.forward_client_headers", tip_key: "tip.config.forward_client_headers" },
     ]
 }
@@ -212,9 +215,10 @@ mod tests {
 
     /// `router_settings_fields()` must register every RouterSettings field
     /// that's exposed in the dashboard config page (excludes `kvc_aware`
-    /// sub-tree — it has its own card — and `model_group_alias` — free-form
-    /// JSON). Adding a new RouterSettings field without registering it here
-    /// fails this test, mirroring the deployment-field contract above.
+    /// sub-tree — it has its own card — and `model_group_alias` — managed
+    /// on the Models page). Adding a new RouterSettings field without
+    /// registering it here fails this test, mirroring the deployment-field
+    /// contract above.
     ///
     /// This test exists because RouterSettings/KvcAwareSettings used to drift
     /// silently: when upstream renamed `key_affinity_rebalance_threshold` →
@@ -229,10 +233,11 @@ mod tests {
             .map(|m| m.field)
             .collect();
 
-        // Every field rendered on the dashboard router-settings card must be
-        // registered here. `kvc_aware` is rendered in its own collapsible card
-        // (separate `KvcAwareSettings` struct); `model_group_alias` is a
-        // free-form JSON textarea without per-field schema.
+        // Every field rendered on the dashboard config cards must be
+        // registered here (router card + the three router_settings fields
+        // surfaced on the General card). `kvc_aware` is rendered in its own
+        // collapsible card (separate `KvcAwareSettings` struct);
+        // `model_group_alias` is managed on the Models page (alias CRUD).
         let required_fields = [
             "schedule_policy",
             "key_affinity_context_threshold",

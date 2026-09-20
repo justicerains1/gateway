@@ -4,7 +4,7 @@ use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::KvIndexBackend;
@@ -88,6 +88,16 @@ pub struct TokenPrefixIndex {
     /// Stale-sweep throttle state (millis since construction).
     sweep_clock: std::time::Instant,
     last_sweep_ms: AtomicU64,
+    /// Set by every shell-producing path (evict_single_block / remove_worker;
+    /// TTL prune goes through evict_single_block). sweep_stale consumes it as
+    /// an O(1) gate: with no eviction since the last completed sweep there is
+    /// provably nothing to reclaim, so the full-tree BFS is skipped entirely
+    /// (steady-state tries used to pay a whole-tree walk every tick).
+    sweep_pending: AtomicBool,
+    /// How many full-tree sweeps actually ran (gate passed). Diagnostic:
+    /// with the gate this stays flat in steady state and only moves after
+    /// eviction bursts.
+    sweep_attempts: AtomicU64,
     block_size: usize,
 }
 
@@ -134,6 +144,8 @@ impl TokenPrefixIndex {
             // `now_ms.saturating_sub(u64::MAX)` saturates to 0, which would
             // make every call return early (sweep never runs).
             last_sweep_ms: AtomicU64::new(u64::MAX),
+            sweep_pending: AtomicBool::new(false),
+            sweep_attempts: AtomicU64::new(0),
             block_size,
         }
     }
@@ -169,6 +181,8 @@ impl TokenPrefixIndex {
             Some((_, n)) => n,
             None => return, // already evicted or never recorded
         };
+        // Claim removed → a shell may be left behind. Arm the sweep gate.
+        self.sweep_pending.store(true, Ordering::Release);
         // Blocking write is safe here: node locks are only ever held briefly
         // and always parent-before-child, and this path holds no other lock
         // while acquiring the node, so no lock-order cycle is possible.
@@ -454,6 +468,12 @@ impl KvIndexBackend for TokenPrefixIndex {
             guard.workers.remove(worker_id);
         }
         self.blocks.fetch_sub(removed, Ordering::Relaxed);
+        if removed > 0 {
+            // Claims removed → shells may remain under every touched node.
+            // Arm the sweep gate (remove_worker doesn't go through
+            // evict_single_block, so it must set the flag itself).
+            self.sweep_pending.store(true, Ordering::Release);
+        }
         // Clean LRU + prune_timers for this worker
         self.prune_timers.lock().remove_worker(worker_id);
         {
@@ -554,6 +574,20 @@ impl KvIndexBackend for TokenPrefixIndex {
     /// later sweep. No global lock (DashMap/Mutex) is held while a node lock
     /// is held.
     fn sweep_stale(&self) {
+        // O(1) gate: shells can ONLY be created by eviction or TTL prune
+        // (both funnel through evict_single_block) or by remove_worker — every
+        // such path sets sweep_pending. If no such event happened since the
+        // last completed sweep, there is provably nothing to reclaim: skip
+        // the full-tree BFS entirely instead of walking a steady-state trie
+        // (dynamo arms its cleanup the same way — from removal paths only).
+        // Load-only check FIRST: consuming the flag before the throttle below
+        // would lose it on an early throttle return (shells would then wait
+        // for the NEXT eviction to be seen). The flag is consumed only after
+        // this thread wins the throttle — a new eviction arriving after that
+        // swap re-arms it for the next tick, so nothing is lost.
+        if !self.sweep_pending.load(Ordering::Acquire) {
+            return;
+        }
         // Throttle: at most one sweep per SWEEP_INTERVAL_MS.
         let now_ms = self.sweep_clock.elapsed().as_millis() as u64;
         let last = self.last_sweep_ms.load(Ordering::Relaxed);
@@ -569,6 +603,10 @@ impl KvIndexBackend for TokenPrefixIndex {
         {
             return; // another thread is sweeping
         }
+        // This thread owns the sweep slot — NOW consume the gate. Evictions
+        // arriving after this swap re-arm the flag for the next tick.
+        self.sweep_pending.store(false, Ordering::Release);
+        self.sweep_attempts.fetch_add(1, Ordering::Relaxed);
 
         // Collect model roots FIRST and release the DashMap shard read lock
         // before walking: holding `tries.iter()`'s Ref across the BFS/sort/
@@ -1028,6 +1066,76 @@ mod tests {
         assert!(idx.debug_dump().is_empty());
         // Only the root survives the sweep.
         assert_eq!(idx.node_count(), 1);
+    }
+
+    #[test]
+    fn test_sweep_gate_skips_steady_state() {
+        let idx = TokenPrefixIndex::new(4, 1_000_000);
+        idx.record_request_prefix("m", "w0", &[1, 2, 3, 4, 5, 6, 7, 8], StorageTier::Gpu);
+        assert_eq!(idx.block_count(), 2);
+        // Recording alone creates no shells — the gate must skip the BFS.
+        idx.sweep_stale();
+        assert_eq!(
+            idx.sweep_attempts.load(Ordering::Relaxed),
+            0,
+            "no eviction since construction → sweep must be skipped"
+        );
+        // Eviction arms the gate; the next sweep runs once and reclaims.
+        let h1 = hash_block_bytes(&[1, 2, 3, 4]);
+        let h2 = chain_block_hash(h1, hash_block_bytes(&[5, 6, 7, 8]));
+        idx.evict_single_block("m", "w0", h1);
+        idx.evict_single_block("m", "w0", h2);
+        idx.sweep_stale();
+        assert_eq!(idx.sweep_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(idx.node_count(), 1, "both shells reclaimed");
+        // Gate was consumed → back to O(1) skip.
+        idx.sweep_stale();
+        assert_eq!(idx.sweep_attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_sweep_gate_armed_by_remove_worker() {
+        let idx = TokenPrefixIndex::new(4, 1_000_000);
+        idx.record_request_prefix("m", "w0", &[1, 2, 3, 4], StorageTier::Gpu);
+        idx.sweep_stale();
+        assert_eq!(idx.sweep_attempts.load(Ordering::Relaxed), 0);
+        // remove_worker strips claims without going through
+        // evict_single_block — it must arm the gate itself.
+        idx.remove_worker("w0");
+        idx.sweep_stale();
+        assert_eq!(idx.sweep_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(idx.node_count(), 1, "shell reclaimed after worker removal");
+    }
+
+    #[test]
+    fn test_deep_chain_sweep_gate_ttl_reclaim_no_stack_overflow() {
+        let block_size = 64;
+        // Same shape as test_deep_chain_prune_and_drop_no_stack_overflow, but
+        // asserting the GATE: skip before TTL prune, one full iterative sweep
+        // after. 50k-deep shell chain must unwind without recursion.
+        let depth = 50_000;
+        let mut prefix: Vec<u8> = Vec::with_capacity(depth * block_size);
+        for i in 0..depth as u32 {
+            let b = i.to_le_bytes();
+            prefix.extend_from_slice(&b);
+            prefix.resize(prefix.len() + block_size - b.len(), 0);
+        }
+        let idx = TokenPrefixIndex::new(block_size, 1_000_000);
+        idx.record_request_prefix("m", "w0", &prefix, StorageTier::Gpu);
+        assert_eq!(idx.block_count(), depth);
+
+        // Steady state: no eviction yet → gate skips, no BFS.
+        idx.sweep_stale();
+        assert_eq!(idx.sweep_attempts.load(Ordering::Relaxed), 0);
+
+        // Wholesale TTL expiry arms the gate (prune funnels through
+        // evict_single_block). The next sweep must run and unwind the whole
+        // 50k-shell chain iteratively (deepest-first edge list, drop depth 1).
+        idx.prune_expired(std::time::Duration::ZERO);
+        assert_eq!(idx.block_count(), 0);
+        idx.sweep_stale();
+        assert_eq!(idx.sweep_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(idx.node_count(), 1, "all 50k shells reclaimed in one gated sweep");
     }
 
     #[test]

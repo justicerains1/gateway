@@ -155,13 +155,11 @@ impl KvcOrchestrator {
         let inflight_model = self.router.resolve_model_name(resolved_model);
 
         // ── Step 4: compute DFX ──
-        let schedule_policy = {
-            let base = self.router.policy_name();
-            if selection.degraded && base == "kvc_aware" {
-                "kvc_aware→lowest_load".to_string()
-            } else {
-                base
-            }
+        // Policy label is uniformly "kvc" (degraded sub-modes — gate lift,
+        // empty prefix — are visible in the selection log, not the label).
+        let schedule_policy = match self.router.policy_name().as_str() {
+            "kvc_aware" => "kvc".to_string(),
+            other => other.to_string(),
         };
         let kv_hit_blocks = selection.kv_hit_blocks;
         let kv_input_blocks = selection.kv_input_blocks;

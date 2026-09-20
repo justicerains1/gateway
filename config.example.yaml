@@ -144,8 +144,9 @@ router_settings:
   # routing_strategy: kvc_aware
   # kvc_aware:
   #   # 块大小（字节）。512 ≈ 128 token（英文）/ ~170 token（中文）。
-  #   # 想完整支持 128K 上下文（hit_ratio 能到 1.0）用 2048：
-  #   #   256 块 × 2048 = 512KB ≈ 128K+ token。
+  #   # 整个请求前缀全部记录（无单请求块数上限），链深随上下文增长
+  #   #（1M token 上下文 ≈ 8000 块）；所有释放路径均为非级联迭代式，
+  #   # 深链不会栈溢出。
   #   block_size: 512
   #   # 统一评分权重：score = cache_weight·hit + load_weight·(1-load%)。
   #   # 二者各自取 0.0..=1.0，且 cache_weight + load_weight ≤ 1.0（归一化）。
@@ -158,10 +159,6 @@ router_settings:
   #   # TTL（秒）：自学习块无真实 evict 信号，到期由后台扫描删除。
   #   # 0 = 禁用 TTL 扫描（只用 LRU 淘汰）；>0 = 秒数，后台每 ttl/2 扫一次。默认 1200。
   #   router_ttl_secs: 1200.0
-  #   # 单请求最多记录 256 块（≈ block_size×256 字节前缀），封顶防长请求
-  #   # 占用过多 record/锁开销。256×512B=128KB≈36K token；
-  #   # 256×2048B=512KB≈128K token。
-  #   # 128K 上下文建议 block_size: 2048。
 
   # 内容路由：根据请求内容自动选择模型（可选）
   # auto_router:

@@ -676,8 +676,9 @@ pub struct KvcAwareSettings {
     /// Block size in BYTES for the gateway-side prefix serialization chunking.
     /// The request's serialized prefix (system+tools+messages) is sliced into
     /// blocks of this many bytes; each block is xxhash3-64'd into a trie edge.
-    /// Default: 512 (≈ original 128-token granularity; 256-block record cap
-    /// covers 128KB, enough for a typical system+tools prefix).
+    /// Default: 512 (≈ original 128-token granularity). The whole request
+    /// prefix is recorded (no per-request block cap), so chains grow to the
+    /// full context length; safe because all release paths are non-cascading.
     #[serde(default = "default_block_size")]
     pub block_size: usize,
     /// Weight for cache hit score in combined scoring. Default: 0.7.

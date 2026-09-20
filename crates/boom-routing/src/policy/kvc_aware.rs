@@ -44,6 +44,10 @@ pub struct KvcAwarePolicy {
     rebalance_threshold: u64,
     /// Round-robin counter for tie-breaking among equal top scores (LB).
     tie_counter: AtomicU64,
+    /// Counter for rate-limiting the all-overloaded warn (log once at first
+    /// occurrence, then every `OVERLOAD_WARN_EVERY` requests — an overload
+    /// storm must not flood the warn channel at per-request rate).
+    overload_warn_counter: AtomicU64,
     /// Optional tracker for rebalance-move counters (Debug page "Rebalance Moves").
     /// Records (from, to) deployment ids on each capacity rebalance handoff.
     rebalance_move_tracker: Option<Arc<RebalanceMoveTracker>>,
@@ -64,6 +68,7 @@ impl KvcAwarePolicy {
             overload_threshold_pct: 100,
             rebalance_threshold: 100,
             tie_counter: AtomicU64::new(0),
+            overload_warn_counter: AtomicU64::new(0),
             rebalance_move_tracker,
         }
     }
@@ -205,9 +210,8 @@ impl SchedulePolicy for KvcAwarePolicy {
             depth: u64,
             load_pct: u64,
         }
-        let mut scored: Vec<Scored> = Vec::new();
-        let mut overloaded: Vec<String> = Vec::new();
-        for cand in candidates {
+        // Score one candidate on the unified axis.
+        let score_cand = |cand: &Arc<dyn Provider>| -> Scored {
             // Effective hit/depth = max across the candidate's own worker and
             // its KV-sharing peers (a peer's cached prefix is reusable via the
             // shared pool).
@@ -225,37 +229,49 @@ impl SchedulePolicy for KvcAwarePolicy {
                     (best_hit, best_depth)
                 })
                 .unwrap_or((0.0, 0));
-
             let load_pct = deployment_load(&self.tracker, &self.queue_info, model, cand.as_ref());
-            if self.overload_threshold_pct < 100 && load_pct >= self.overload_threshold_pct {
-                overloaded.push(
-                    cand.kv_worker_id().unwrap_or("?").to_string(),
-                );
-                continue;
-            }
             let load_avail = 1.0 - (load_pct.min(100) as f64 / 100.0);
             let score = self.cache_weight * hit + self.load_weight * load_avail;
-            scored.push(Scored {
-                score,
-                provider: cand.clone(),
-                hit,
-                depth,
-                load_pct,
-            });
+            Scored { score, provider: cand.clone(), hit, depth, load_pct }
+        };
+
+        // Pass 1: score candidates with the overload gate applied.
+        let mut scored: Vec<Scored> = Vec::new();
+        let mut overloaded: Vec<String> = Vec::new();
+        for cand in candidates {
+            let pre = score_cand(cand);
+            if self.overload_threshold_pct < 100
+                && pre.load_pct >= self.overload_threshold_pct
+            {
+                overloaded.push(cand.kv_worker_id().unwrap_or("?").to_string());
+                continue;
+            }
+            scored.push(pre);
         }
 
-        // All candidates overloaded → route to lowest-load anyway (don't drop
-        // the request). Hit ratio 0 ⇒ gateway will request a full report.
-        if scored.is_empty() {
-            let picked = select_lowest_load(&self.tracker, &self.queue_info, model, candidates);
-            tracing::warn!(
-                model,
-                ?overloaded,
-                routed = ?picked.as_ref().and_then(|p| p.kv_worker_id().map(|s| s.to_string())),
-                "all candidates overloaded, fallback to lowest-load"
-            );
-            return picked
-                .map(|provider| Selection { provider, kv_hit_ratio: 0.0, kv_hit_blocks: 0, kv_input_blocks: request_total_blocks, kv_match_attempted: true, degraded: false });
+        // All candidates overloaded → do NOT fall back to lowest-load. Under
+        // full overload load-balancing has nothing left to win: hopping to the
+        // marginally-less-loaded worker oscillates (W1↔W2 churn observed in
+        // production) and abandons warm caches for no capacity relief.
+        // Instead the gate is lifted and the normal unified score decides —
+        // cache affinity keeps requests on their warm worker, and rebalance
+        // is suppressed below so no hand-off migration happens either.
+        let all_overloaded = scored.is_empty();
+        if all_overloaded {
+            // Rate-limited: first occurrence + every 10_000th request. An
+            // overload storm is exactly when the warn channel matters — one
+            // line per request would drown every other alert.
+            const OVERLOAD_WARN_EVERY: u64 = 10_000;
+            let n = self.overload_warn_counter.fetch_add(1, Ordering::Relaxed);
+            if n == 0 || n % OVERLOAD_WARN_EVERY == 0 {
+                tracing::warn!(
+                    model,
+                    ?overloaded,
+                    occurrences = n + 1,
+                    "all candidates overloaded, overload gate lifted — affinity pick (no migration)"
+                );
+            }
+            scored = candidates.iter().map(score_cand).collect();
         }
 
         // Pick the top score; round-robin among exact ties so equal-score
@@ -307,18 +323,26 @@ impl SchedulePolicy for KvcAwarePolicy {
         // pick a reasonable worker, and the record step makes subsequent
         // requests sticky to it.
 
-        // Trie fill for diagnostics.
+        // Trie fill for diagnostics. `trie_nodes` (live trie nodes) vs
+        // `trie_blocks` (claims): the gap is the shell population — nodes
+        // left by non-cascading eviction, awaiting sweep_stale reclaim.
+        // Watch `trie_nodes` across pressure rounds: plateau = sweep keeps
+        // up; linear growth = node accumulation.
         let trie_blocks = self.kv_index.block_count();
         let trie_capacity = self.kv_index.block_capacity();
+        let trie_nodes = self.kv_index.node_count();
 
         // Rebalance: when the winner is markedly more loaded than the least-
         // loaded non-overloaded candidate, hand off to the least-loaded so
         // traffic spreads by capacity — same policy as key_affinity (pure
         // load balancing; target is NOT picked by cache score). Disabled
-        // when rebalance_threshold >= 100. Only runs on the non-degraded
-        // path (degraded = empty prefix → lowest_load, returns early before
-        // this stage).
-        let winner = if self.rebalance_threshold < 100 {
+        // when rebalance_threshold >= 100, and suppressed when ALL candidates
+        // were overloaded — with everything saturated there is no spare
+        // capacity to spread into, and handing off would just re-ignite the
+        // oscillation the gate-lift above avoids. Only runs on the
+        // non-degraded path (degraded = empty prefix → lowest_load, returns
+        // early before this stage).
+        let winner = if self.rebalance_threshold < 100 && !all_overloaded {
             let load_winner = winner.load_pct;
             let least_loaded = scored
                 .iter()
@@ -365,6 +389,7 @@ impl SchedulePolicy for KvcAwarePolicy {
                 ties = ties.len(),
                 trie_blocks,
                 trie_capacity,
+                trie_nodes,
                 request_bytes = prefix_bytes.len(),
                 "KVC selected (affinity)"
             );
@@ -382,6 +407,7 @@ impl SchedulePolicy for KvcAwarePolicy {
                 ties = ties.len(),
                 trie_blocks,
                 trie_capacity,
+                trie_nodes,
                 request_bytes = prefix_bytes.len(),
                 "KVC selected (cold, load+round-robin)"
             );
@@ -392,7 +418,7 @@ impl SchedulePolicy for KvcAwarePolicy {
             kv_hit_blocks: winner.depth,
             kv_input_blocks: request_total_blocks,
             kv_match_attempted: true,
-            degraded: false,
+            degraded: all_overloaded,
         })
     }
 

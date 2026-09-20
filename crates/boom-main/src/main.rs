@@ -16,6 +16,17 @@ use std::sync::Arc;
 use state::AppState;
 use tower_http::cors::CorsLayer;
 
+// jemalloc global allocator: the gateway's steady-state workload is millions
+// of small, short-lived allocations (trie nodes, per-request prefix buffers,
+// string clones). glibc's per-thread arenas fragment under this pattern and
+// rarely return freed pages to the OS, so RSS only ever grows — observed as
+// "memory freed (trie nodes → 1) but RSS unchanged". jemalloc's dirty-page
+// decay (dirty_decay_ms, default 10s) actively returns freed pages, making
+// RSS track live memory again. Background threads keep decay/purge off the
+// request path.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser, Debug)]
 #[command(name = "boom-gateway", about = "BooMGateway — High-performance LLM API Gateway")]
 struct Args {

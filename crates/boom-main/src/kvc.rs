@@ -48,8 +48,21 @@ pub struct KvcOrchestrator {
     kv_index: Arc<ArcSwap<Option<Arc<dyn KvIndexBackend>>>>,
     router: Arc<Router>,
     /// Bounds the number of concurrent best-effort record tasks so a request
-    /// burst can't spawn an unbounded flock of trie-writers.
+    /// burst can't spawn an unbounded flock of trie-writers. Record work is
+    /// pure synchronous CPU (hash + trie walk); concurrency beyond the CPU
+    /// count only adds lock contention, and each task runs on the blocking
+    /// pool (spawn_blocking) so tokio's async workers are never occupied by it.
     record_semaphore: Arc<Semaphore>,
+}
+
+/// Record tasks are throughput-bound sync CPU — cap concurrency at the CPU
+/// count (further tasks just contend on trie shard locks), with a small
+/// ceiling to leave headroom in the shared blocking pool for real I/O.
+fn record_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8)
 }
 
 impl KvcOrchestrator {
@@ -60,11 +73,10 @@ impl KvcOrchestrator {
         Self {
             kv_index,
             router,
-            record_semaphore: Arc::new(Semaphore::new(32)),
+            record_semaphore: Arc::new(Semaphore::new(record_concurrency())),
         }
     }
 
-    /// Serialize the request's prefix-relevant content (messages + tools) to a
     /// Serialize the request's prefix-relevant content (messages + tools) to a
     /// deterministic byte buffer. `serde_json::to_string` is deterministic for a
     /// given value (struct field order), so record and query — both derived
@@ -179,7 +191,13 @@ impl KvcOrchestrator {
             // one (best-effort — a missed record just means one extra cold
             // request later, not a correctness issue).
             if let Ok(permit) = self.record_semaphore.clone().try_acquire_owned() {
-                tokio::spawn(async move {
+                // spawn_blocking, NOT tokio::spawn: record_request_prefix is
+                // synchronous CPU work. On an async worker it occupies a
+                // runtime thread without ever yielding, and enough concurrent
+                // records starve the reactor (observed as DB-pool timeouts and
+                // ~19x latency inflation under load). The blocking pool keeps
+                // async workers free; the semaphore still bounds total tasks.
+                tokio::task::spawn_blocking(move || {
                     let _permit = permit; // held until record completes
                     let g = kv_index.load();
                     let idx = match (**g).as_ref() {

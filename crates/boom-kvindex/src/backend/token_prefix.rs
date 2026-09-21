@@ -515,13 +515,18 @@ impl KvIndexBackend for TokenPrefixIndex {
             return;
         }
         let n_full = prefix_bytes.len() / self.block_size;
-        let mut blocks: Vec<boom_core::kv_event::BatchBlock> = Vec::with_capacity(n_full);
+        let mut prepared: Vec<(u64, u64, StorageTier)> = Vec::with_capacity(n_full);
         // Track the chain-scoped effective hash: eff(0) = content_hash(0),
         // eff(i) = chain_block_hash(eff(i-1), content_hash(i)). Identical
         // content at different positions gets different lookup keys, so
         // block_lookup stays 1:1 with trie nodes and eviction (TTL/LRU) is
-        // exact. `parent_hash` carries the parent's EFFECTIVE hash — that's
-        // what apply_event::Store uses as its block_lookup parent probe.
+        // exact. The trie edge key stays the CONTENT hash (position-blind,
+        // shapes the tree); the lookup/LRU key is the position-scoped eff.
+        //
+        // Prepared tuples go straight into apply_prepared — no BatchBlock
+        // staging, no per-block byte copy, and no second hash pass (the
+        // event path re-hashes block_bytes because ZMQ events carry raw
+        // bytes; the record path already has both hashes).
         let mut parent_eff: Option<u64> = None;
         for i in 0..n_full {
             let chunk = &prefix_bytes[i * self.block_size..(i + 1) * self.block_size];
@@ -530,16 +535,10 @@ impl KvIndexBackend for TokenPrefixIndex {
                 None => content,
                 Some(p) => chain_block_hash(p, content),
             };
-            blocks.push(boom_core::kv_event::BatchBlock {
-                local_hash: eff,
-                parent_hash: parent_eff,
-                block_bytes: chunk.to_vec(),
-                block_size: self.block_size as u32,
-                storage_tier,
-            });
+            prepared.push((content, eff, storage_tier));
             parent_eff = Some(eff);
         }
-        self.apply_store_batch(model, worker_id, blocks);
+        self.apply_prepared(model, worker_id, prepared);
     }
 
     fn prune_expired(&self, ttl: std::time::Duration) {
@@ -729,10 +728,9 @@ impl TokenPrefixIndex {
         if blocks.is_empty() {
             return;
         }
-
-        // Pre-compute per-block data (hashes only — the raw bytes are no
-        // longer retained per node, so no prefix copy is staged here).
-        let now = std::time::Instant::now();
+        // Event path: ZMQ StoreBatch carries raw block bytes (no precomputed
+        // hashes), so hash each block ONCE here and delegate. Blocks with
+        // local_hash == 0 fall back to the content hash as the lookup key.
         let prepared: Vec<(u64, u64, StorageTier)> = blocks
             .iter()
             .map(|b| {
@@ -741,7 +739,25 @@ impl TokenPrefixIndex {
                 (trie_key, effective_hash, b.storage_tier)
             })
             .collect();
+        self.apply_prepared(model, worker_id, prepared);
+    }
 
+    /// Shared insert core for both entry paths. `prepared` carries
+    /// `(trie_edge_key, effective/lookup hash, tier)` per block — the record
+    /// path computes both hashes inline (single pass, zero copies); the event
+    /// path re-derives them from raw block bytes in apply_store_batch.
+    ///
+    /// Trie walk FIRST: insert ALL blocks into the trie structure.
+    fn apply_prepared(
+        &self,
+        model: &str,
+        worker_id: &str,
+        prepared: Vec<(u64, u64, StorageTier)>,
+    ) {
+        if prepared.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
         // Trie walk FIRST: insert ALL blocks into the trie structure.
         // Then LRU push + eviction — so evict_single_block can find the
         // nodes in the trie (they exist by this point). If eviction ran
@@ -1188,5 +1204,221 @@ mod tests {
         assert_eq!(idx.block_count(), 1);
         idx.remove_worker("w0");
         assert_eq!(idx.block_count(), 0);
+    }
+
+    // ── Record-path perf refactor guards ─────────────────────────────────
+    //
+    // record_request_prefix now feeds apply_prepared directly (precomputed
+    // (content_hash, eff, tier) tuples) instead of staging BatchBlocks with
+    // per-block byte copies that apply_store_batch re-hashed. The event path
+    // (StoreBatch) maps through the same core. These tests pin the two paths
+    // to identical observable state.
+
+    #[test]
+    fn test_record_path_equivalence_with_event_batch() {
+        // Prefix with repeated content (A,B,A) so both the trie edge key
+        // (content, position-blind) and the lookup key (eff, position-scoped)
+        // are exercised with non-trivial divergence.
+        let prefix: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4];
+
+        // Path A: self-learning record (direct hash-passing core).
+        let idx_record = TokenPrefixIndex::new(4, 1_000_000);
+        idx_record.record_request_prefix("m", "w0", prefix, StorageTier::Gpu);
+
+        // Path B: event replay — same eff chain the record path computes,
+        // carried in BatchBlocks with raw bytes (apply_store_batch re-hashes).
+        let mut blocks: Vec<boom_core::kv_event::BatchBlock> = Vec::new();
+        let mut parent_eff: Option<u64> = None;
+        for chunk in prefix.chunks(4) {
+            let content = hash_block_bytes(chunk);
+            let eff = parent_eff.map_or(content, |p| chain_block_hash(p, content));
+            blocks.push(boom_core::kv_event::BatchBlock {
+                local_hash: eff,
+                parent_hash: parent_eff,
+                block_bytes: chunk.to_vec(),
+                block_size: 4,
+                storage_tier: StorageTier::Gpu,
+            });
+            parent_eff = Some(eff);
+        }
+        let idx_event = TokenPrefixIndex::new(4, 1_000_000);
+        idx_event.apply_store_batch("m", "w0", blocks);
+
+        // Identical observable state on every surface.
+        assert_eq!(idx_record.block_count(), idx_event.block_count());
+        assert_eq!(idx_record.node_count(), idx_event.node_count());
+        assert_eq!(idx_record.debug_dump(), idx_event.debug_dump());
+        let m_rec = idx_record.find_matches("m", prefix, &["w0".to_string()]);
+        let m_evt = idx_event.find_matches("m", prefix, &["w0".to_string()]);
+        assert_eq!(m_rec.len(), m_evt.len());
+        assert_eq!(m_rec.first().map(|m| m.match_depth), m_evt.first().map(|m| m.match_depth));
+        // And eviction sees the same chain-scoped lookup keys on both paths.
+        idx_record.prune_expired(std::time::Duration::ZERO);
+        idx_event.prune_expired(std::time::Duration::ZERO);
+        idx_record.sweep_stale();
+        idx_event.sweep_stale();
+        assert_eq!(idx_record.node_count(), idx_event.node_count());
+        assert_eq!(idx_record.node_count(), 1);
+    }
+
+    #[test]
+    fn test_deep_chain_record_and_match_100k_no_stack_overflow() {
+        let block_size = 64;
+        // 100k blocks × 64B = 6.4MB prefix — beyond any realistic context,
+        // stressing record (new direct path), find_matches (query walk),
+        // wholesale TTL prune, gated sweep, and whole-index drop in sequence.
+        let depth = 100_000;
+        let mut prefix: Vec<u8> = Vec::with_capacity(depth * block_size);
+        for i in 0..depth as u32 {
+            let b = i.to_le_bytes();
+            prefix.extend_from_slice(&b);
+            prefix.resize(prefix.len() + block_size - b.len(), 0);
+        }
+        let idx = TokenPrefixIndex::new(block_size, 10_000_000);
+        idx.record_request_prefix("m", "w0", &prefix, StorageTier::Gpu);
+        assert_eq!(idx.block_count(), depth);
+        assert_eq!(idx.node_count(), depth + 1);
+
+        // Query walk over the full chain: exact hit at max depth.
+        let m = idx.find_matches("m", &prefix, &["w0".to_string()]);
+        let best = m.first().expect("full-chain match");
+        assert_eq!(best.match_depth, depth as u64);
+        assert_eq!(best.total_blocks, depth as u64);
+        assert!((best.hit_ratio - 1.0).abs() < 1e-9);
+
+        idx.prune_expired(std::time::Duration::ZERO);
+        assert_eq!(idx.block_count(), 0);
+        idx.sweep_stale();
+        assert_eq!(idx.node_count(), 1);
+        drop(idx);
+    }
+
+    #[test]
+    fn test_deep_chain_duplicate_content_no_stack_overflow() {
+        let block_size = 64;
+        // 50k-deep chain whose block contents cycle through only 256 distinct
+        // values: every content hash repeats ~195 times, so the trie is a
+        // 50k-deep chain over 256 edge values while the lookup keys (eff) are
+        // all position-distinct. Deep-direction dedup of chain-scoped keys +
+        // full reclaim, all iterative.
+        let depth = 50_000;
+        let mut prefix: Vec<u8> = Vec::with_capacity(depth * block_size);
+        for i in 0..depth {
+            prefix.extend(std::iter::repeat((i % 256) as u8).take(block_size));
+        }
+        let idx = TokenPrefixIndex::new(block_size, 10_000_000);
+        idx.record_request_prefix("m", "w0", &prefix, StorageTier::Gpu);
+        // All positions claimable → lookup stayed 1:1 with chain positions.
+        assert_eq!(idx.block_count(), depth);
+        assert_eq!(idx.node_count(), depth + 1);
+
+        idx.prune_expired(std::time::Duration::ZERO);
+        assert_eq!(idx.block_count(), 0, "repeated content must be fully evictable at depth");
+        idx.sweep_stale();
+        assert_eq!(idx.node_count(), 1, "no immortal shells from repeated content");
+        drop(idx);
+    }
+
+    #[test]
+    fn test_concurrent_record_and_find_no_deadlock() {
+        // spawn_blocking raises real cross-thread concurrency on the record
+        // path: hand-over-hand write locks (record) must interleave safely
+        // with read traversals (find_matches) with no deadlock and no
+        // counter drift. 8 writers × distinct workers over the SAME prefix +
+        // 4 readers hammering find_matches concurrently.
+        let block_size = 4;
+        let n_blocks = 256;
+        let mut prefix: Vec<u8> = Vec::with_capacity(n_blocks * block_size);
+        for i in 0..n_blocks as u32 {
+            let b = i.to_le_bytes();
+            prefix.extend_from_slice(&b);
+            prefix.resize(prefix.len() + block_size - b.len(), 0);
+        }
+        let idx = std::sync::Arc::new(TokenPrefixIndex::new(block_size, 1_000_000));
+        let workers: Vec<String> = (0..8).map(|i| format!("w{i}")).collect();
+
+        std::thread::scope(|s| {
+            for w in &workers {
+                let idx = idx.clone();
+                let prefix = prefix.as_slice();
+                let w = w.clone();
+                s.spawn(move || {
+                    // Re-record the same prefix: idempotent inserts under
+                    // concurrent writers must not double-count.
+                    for _ in 0..10 {
+                        idx.record_request_prefix("m", &w, prefix, StorageTier::Gpu);
+                    }
+                });
+            }
+            let worker_ids = workers.clone();
+            for _ in 0..4 {
+                let idx = idx.clone();
+                let prefix = prefix.as_slice();
+                let worker_ids = worker_ids.clone();
+                s.spawn(move || {
+                    for _ in 0..1_000 {
+                        let m = idx.find_matches("m", prefix, &worker_ids);
+                        assert!(!m.is_empty());
+                    }
+                });
+            }
+        });
+
+        // Shared trie shape: one chain of n_blocks nodes; every worker claims
+        // each node, and each (worker, position) pair is one lookup entry.
+        assert_eq!(idx.block_count(), workers.len() * n_blocks, "exact claim count, no drift");
+        assert_eq!(idx.node_count(), n_blocks + 1);
+        for w in &workers {
+            let m = idx.find_matches("m", &prefix, std::slice::from_ref(w));
+            assert_eq!(m[0].match_depth, n_blocks as u64);
+        }
+        // Reclaim under per-worker removal also stays exact.
+        for w in &workers {
+            idx.remove_worker(w);
+        }
+        assert_eq!(idx.block_count(), 0);
+        idx.sweep_stale();
+        assert_eq!(idx.node_count(), 1);
+    }
+
+    #[test]
+    fn test_eviction_storm_gated_sweep_reclaims_all_shells() {
+        // Sustained LRU-eviction storm: 100 sequential prefix recordings into
+        // a tiny max_blocks=8 trie, so every record evicts older chains and
+        // keeps the sweep gate armed throughout. One gated sweep afterwards
+        // must reclaim every empty chain (deepest-first, single pass) leaving
+        // exactly the live blocks.
+        let block_size = 4;
+        let cap = 8;
+        let idx = TokenPrefixIndex::new(block_size, cap);
+        let mut prefix_counter: u32 = 0;
+        for _ in 0..100 {
+            // Each prefix: 4 globally-unique block contents (own chain, no
+            // sharing with other prefixes).
+            let mut prefix: Vec<u8> = Vec::with_capacity(4 * block_size);
+            for _ in 0..4 {
+                let b = prefix_counter.to_le_bytes();
+                prefix.extend_from_slice(&b);
+                prefix_counter += 1;
+            }
+            idx.record_request_prefix("m", "w0", &prefix, StorageTier::Gpu);
+        }
+        let live = idx.block_count();
+        assert_eq!(live, cap, "steady-state capacity: last 2 prefixes survive");
+        assert!(
+            idx.sweep_pending.load(Ordering::Acquire),
+            "eviction storm must keep the gate armed"
+        );
+
+        idx.sweep_stale();
+        assert_eq!(idx.sweep_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            idx.node_count(),
+            live + 1,
+            "one deepest-first pass reclaims all evicted chains, leaving root + live blocks"
+        );
+        // Gate consumed and no further evictions → back to O(1) skip.
+        idx.sweep_stale();
+        assert_eq!(idx.sweep_attempts.load(Ordering::Relaxed), 1);
     }
 }

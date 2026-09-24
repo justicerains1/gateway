@@ -180,6 +180,11 @@ pub trait KvIndexBackend: Send + Sync {
     fn prune_expired(&self, _ttl: std::time::Duration) {
     }
 
+    /// Sweep stale empty nodes left behind by non-cascading eviction
+    /// (nodes with no workers and no children). Throttled internally;
+    /// safe to call from a periodic task. Default no-op.
+    fn sweep_stale(&self) {}
+
     /// Return all model names currently tracked.
     fn model_names(&self) -> HashSet<String>;
 
@@ -197,6 +202,15 @@ pub trait KvIndexBackend: Send + Sync {
     /// backend doesn't enforce a limit. Reported in the selection log so
     /// `block_count / block_capacity` shows how close the trie is to evicting.
     fn block_capacity(&self) -> usize {
+        0
+    }
+
+    /// Live trie NODE count (roots + interior + leaves). Unlike
+    /// `block_count` (claims, LRU-capped), node count is not capped by
+    /// configuration: `nodes - blocks` is the shell population — the memory
+    /// signal hidden from the fill ratio. Default 0 (backends without a
+    /// node-based structure).
+    fn node_count(&self) -> usize {
         0
     }
 }

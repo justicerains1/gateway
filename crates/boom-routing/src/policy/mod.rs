@@ -31,10 +31,12 @@ pub struct Selection {
     /// there is only one node, prefix affinity is pointless, and internal
     /// disaggregation scheduling (e.g. 2P1D) handles reuse on its own.
     pub kv_match_attempted: bool,
-    /// Whether kvc_aware degraded to key_affinity for this request (hit below
-    /// threshold, or empty token_ids). Used by the DFX log/dashboard to show
-    /// the actual routing behavior (e.g. "kvc→key") rather than just the
-    /// configured policy name.
+    /// Degraded routing marker for this request (kvc_aware): true when the
+    /// prefix context was unusable (empty prefix → lowest-load pick) or when
+    /// ALL candidates were overloaded (gate lifted → affinity pick).
+    /// INFORMATIONAL ONLY — no runtime consumer since the DFX label was
+    /// unified to "kvc" (sub-modes are visible in the selection log). Kept
+    /// for observability/telemetry use; do not branch routing behavior on it.
     pub degraded: bool,
 }
 

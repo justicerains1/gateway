@@ -38,6 +38,12 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures = "0.3"
 
+# allocator (boom-main binary): jemalloc for dirty-page decay — freed memory
+# is returned to the OS instead of fragmenting inside glibc arenas.
+# NOTE: no "background_threads" — that option is pthread-only and aborts
+# child-process startup on macOS (e2e tests spawn the real binary).
+tikv-jemallocator = "0.6"
+
 # web
 axum = { version = "0.8", features = ["macros", "multipart"] }
 tower = { version = "0.5", features = ["full"] }

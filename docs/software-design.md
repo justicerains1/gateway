@@ -202,8 +202,8 @@ boom-trace      → leaf crate，Dashboard 经 boom-core::TraceApi（Arc<dyn Tra
 | F5.2 | Phase B 后端选择策略 trait | `SchedulePolicy::select / select_with_context`，Selection 携带 kv_hit_ratio / degraded 等 DFX 字段；策略 ArcSwap 热切换 | boom-routing | policy/mod.rs |
 | F5.3 | L0 round_robin | per-model 原子计数取模；单候选直返；顶分并列时也用它 tie-break | boom-routing | round_robin.rs |
 | F5.4 | L1 key_affinity | `{key_hash}:{model} → deployment_id` 粘滞；预热期（总量 < context_threshold）走最低负载；粘滞失效校验；负载差超 rebalance_threshold（默认 20，≥100 禁用）自动迁移并记 RebalanceMoveTracker | boom-routing | key_affinity.rs |
-| F5.5 | L3 kvc_aware | 统一评分 `score = cache_weight×hit_ratio + load_weight×(1−load_pct/100)`（默认 0.7/0.3）；过载硬排除（load_pct ≥ overload_threshold_pct=90，100=禁用）；全部过载降级最低负载不丢请求；容量再平衡（winner 超最低非过载候选 rebalance_threshold 即移交）；顶分并列 RR 轮转 | boom-routing | kvc_aware.rs |
-| F5.6 | KV 前缀索引（自学习 trie） | per-model trie：请求前缀（tools 先于 messages 固定序）按 block_size 字节切块 → xxhash3-64 → 块链；per-worker 命中深度 → hit_ratio=depth/total；**不订阅上游事件，路由后异步记录实际选中 worker（自学习，add-only）**；over-approximation 由网关侧 LRU（max_blocks 默认 500k，O(1) 反查表驱逐）+ TTL（后台扫描）老化；每节点独立锁 hand-over-hand 读写 | boom-kvindex / boom-main | token_prefix.rs + KvcOrchestrator（kvc.rs 五步路由） |
+| F5.5 | L3 kvc_aware | 纯前缀亲和评分 `score = hit_ratio`（无负载项、无过载门）；冷请求全员并列 0 分 → RR 轮转摊开；容量再平衡（winner 超最低候选 rebalance_threshold 即移交，唯一的负载干预）；顶分并列 RR 轮转 | boom-routing | kvc_aware.rs |
+| F5.6 | KV 前缀索引（自学习 trie） | per-model trie：请求前缀（tools 先于 messages 固定序）按 512B 代码常量切块 → xxhash3-64 → 块链；per-worker 命中深度 → hit_ratio=depth/total；**不订阅上游事件，路由后异步记录实际选中 worker（自学习，add-only）**；over-approximation 由网关侧 LRU（max_blocks 默认 500k，O(1) 反查表驱逐）+ TTL（后台扫描）老化；每节点独立锁 hand-over-hand 读写 | boom-kvindex / boom-main | token_prefix.rs + KvcOrchestrator（kvc.rs 五步路由） |
 | F5.7 | KvcOrchestrator 路由编排 | policy≠kvc_aware 或单候选跳过 → 前缀序列化 → trie 查询选 provider → degraded 标记 → 信号量（32）限流 + tokio::spawn 异步 best-effort 学习记录 | boom-main | kvc.rs:47-208 |
 | F5.8 | 负载信号总线 | InFlightTracker（model 与 model\0deployment 双维原子计数 + RAII guard）；load_pct = max(inflight, FC queued)/capacity 归一化（防双计）；FlowController 队列深度；RequestRateTracker（per-deployment 成功速率） | boom-routing / boom-flowcontrol | load_helpers.rs |
 | F5.9 | 再平衡可观测 | RebalanceMoveTracker：60min 环形桶统计迁移次数，Dashboard 展示 | boom-routing | rebalance.rs |
@@ -332,7 +332,7 @@ AppState (Clone, 进程生命)
 ### 4.3 关键配置结构
 
 - **ProviderParams**：model（provider/model-id）、api_key/base、aws 凭证、rpm/tpm、timeout（默认 1200s）、headers、temperature/max_tokens。
-- **router_settings**：schedule_policy、model_group_alias（Simple/Extended{hidden}）、key_affinity_context_threshold、rebalance_threshold、auto_router、kvc_aware{block_size/cache_weight/load_weight/max_blocks/overload_threshold_pct/router_ttl_secs}、enable_priority_header、flow_control_queue_timeout_secs、strip_claude_code_attribution、forward_client_headers。
+- **router_settings**：schedule_policy、model_group_alias（Simple/Extended{hidden}）、key_affinity_context_threshold、rebalance_threshold、auto_router、kvc_aware{max_blocks/router_ttl_secs}（块大小为 512B 代码常量 `KV_BLOCK_SIZE`，非配置项）、enable_priority_header、flow_control_queue_timeout_secs、strip_claude_code_attribution、forward_client_headers。
 - **plan_settings**：default_plan / default_team_plan / plans[]（含 schedule 时段）。
 - **deployment_health_check**：path、failure/recovery_threshold、检查间隔。
 - **trace / prompt_log**：OTLP 端点与采样/截断参数（共享 OtlpConfig）。

@@ -81,7 +81,7 @@ pub struct AppState {
     /// THIRD lifecycle (distinct from AppState's other fields): unlike
     /// deployment_store / plan_store / limiter — which survive reloads with
     /// their contents intact — this is rebuilt EMPTY on every reload. Any
-    /// kvc_aware config change (policy, weights, block_size) swaps in a fresh
+    /// kvc_aware config change (policy switch) swaps in a fresh
     /// index; the old trie is dropped and the new one starts empty, repopulated
     /// by the orchestrator recording routed requests (self-contained learning —
     /// no ZMQ subscriber). The transient moment (queries hit an empty trie →
@@ -139,6 +139,12 @@ pub struct HealthStatus {
     pub db_connected: bool,
     pub reload_count: u64,
 }
+
+/// KV prefix-trie chunk granularity, in BYTES. A code constant, NOT a config
+/// knob: tiny blocks (e.g. 1B) turn every long request into ~100k trie nodes,
+/// starving the runtime (DB pool timeouts observed) and fragmenting the
+/// allocator (~1.4G RSS pinned above live heap). 512B ≈ 128-token granularity.
+const KV_BLOCK_SIZE: usize = 512;
 
 impl AppState {
     /// Build state from config. Called once at startup.
@@ -509,22 +515,13 @@ impl AppState {
         let old_router = self.inner.load().config.router_settings.clone();
         // Signature of kvc-relevant config that requires a trie rebuild.
         //   schedule_policy  → enables/disables kvc_aware entirely.
-        //   block_size       → changes the hash algorithm (all entries invalid).
         //   max_blocks       → LRU capacity; LruCache can't resize in-place.
         //   router_ttl_secs  → prune task TTL/interval, fixed at spawn time.
-        // Excluded (hot-updatable via policy recreate, no trie wipe):
-        //   cache_weight / load_weight / overload_threshold_pct / rebalance_threshold.
-        // Only schedule_policy and block_size require a trie wipe (hash algo
-        // changes invalidate all entries). max_blocks / router_ttl_secs don't
+        // block_size is a code constant now (512B), so only the policy switch
+        // itself invalidates entries. max_blocks / router_ttl_secs don't
         // affect existing hashes — the prune task is restarted below to pick
         // up the new TTL, and the LRU capacity adapts on the next batch.
-        let kvc_sig = |r: &boom_config::RouterSettings| {
-            let k = &r.kvc_aware;
-            (
-                r.schedule_policy.clone(),
-                k.block_size,
-            )
-        };
+        let kvc_sig = |r: &boom_config::RouterSettings| r.schedule_policy.clone();
         if kvc_sig(&old_router) == kvc_sig(&new_config.router_settings) {
             tracing::info!("KV-aware subsystem unchanged — preserving learned trie (no rebuild)");
             // Restart prune task to pick up new router_ttl_secs (cheap: abort + spawn)
@@ -662,15 +659,11 @@ impl AppState {
         }
         let kv_settings = &config.router_settings.kvc_aware;
         let index: Arc<dyn KvIndexBackend> = Arc::new(TokenPrefixIndex::new(
-            kv_settings.block_size,
-            kv_settings.cache_weight,
-            kv_settings.load_weight,
+            KV_BLOCK_SIZE,
             kv_settings.max_blocks,
         ));
         tracing::info!(
-            block_size = kv_settings.block_size,
-            cache_weight = kv_settings.cache_weight,
-            load_weight = kv_settings.load_weight,
+            block_size = KV_BLOCK_SIZE,
             max_blocks = kv_settings.max_blocks,
             router_ttl_secs = kv_settings.router_ttl_secs,
             "KV-aware routing enabled (self-contained byte-prefix affinity)"
@@ -689,24 +682,72 @@ impl AppState {
             return;
         }
         let ttl_secs = config.router_settings.kvc_aware.router_ttl_secs;
-        // 0 = TTL prune disabled: rely on LRU (max_blocks) alone. Skip spawning the sweeper
-        // (also avoids Duration::from_secs_f64 on a non-positive value).
+        // 0 = TTL prune disabled: rely on LRU (max_blocks) alone. The task is
+        // still spawned so stale-shell sweeping (sweep_stale) keeps running —
+        // LRU eviction also leaves shells behind. It throttles internally, so
+        // a fixed interval is fine.
         if !(ttl_secs > 0.0) {
-            tracing::info!("KV TTL prune disabled (router_ttl_secs=0), using LRU only");
+            tracing::info!("KV TTL prune disabled (router_ttl_secs=0), using LRU + stale sweep only");
+            let kv_index = self.kv_index.clone();
+            let handle = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                ticker.tick().await; // first tick is immediate
+                loop {
+                    ticker.tick().await;
+                    // Best-effort tick: a panic inside sweep_stale kills only
+                    // THIS pass — without the catch the whole task would die
+                    // silently and cleaning would stop until the next reload.
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let g = kv_index.load();
+                        if let Some(idx) = (**g).as_ref() {
+                            idx.sweep_stale();
+                        }
+                    }));
+                    if r.is_err() {
+                        tracing::error!("KV sweep tick panicked — task continues on next tick");
+                    }
+                }
+            });
+            *self.kv_prune_handle.lock().unwrap() = Some(handle);
             return;
         }
         let ttl = std::time::Duration::from_secs_f64(ttl_secs);
-        // Sweep at half the TTL so a block lives at most ~ttl.
-        let interval = std::time::Duration::from_secs_f64((ttl_secs / 2.0).max(5.0));
+        // Tick at min(ttl/2, 60s) — a block lives at most ~ttl + 60s.
+        // Capping at 60s matters for TTL > 120: TTL-expired shells are
+        // reclaimed by the sweep in the SAME tick that prunes them (zero
+        // lag), but LRU shells are produced on the record path whenever the
+        // trie is at max_blocks — they accumulate between ticks. With a
+        // ttl/2-only interval a 1200s TTL would leave LRU shells piling up
+        // for up to 600s under pressure. prune_expired on a not-yet-due heap
+        // is an O(1) peek, so the extra wakeups are free. The tighter tick
+        // also makes TTL expiry more precise (ttl + 60s instead of
+        // ttl + ttl/2) — accepted as within the configured window.
+        let interval = std::time::Duration::from_secs_f64((ttl_secs / 2.0).min(60.0).max(5.0));
         let kv_index = self.kv_index.clone();
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await; // first tick is immediate
             loop {
                 ticker.tick().await;
-                let g = kv_index.load();
-                if let Some(idx) = (**g).as_ref() {
-                    idx.prune_expired(ttl);
+                // Best-effort tick: a panic inside prune/sweep kills only
+                // THIS pass — without the catch the whole task would die
+                // silently and TTL/shell cleanup would stop until the next
+                // reload (symptom: memory grows with no error anywhere).
+                // Cleanup is idempotent: a half-finished pass is simply
+                // finished by the next tick.
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let g = kv_index.load();
+                    if let Some(idx) = (**g).as_ref() {
+                        idx.prune_expired(ttl);
+                        // Reclaim empty shell nodes left by non-cascading
+                        // eviction (internal throttle caps actual sweep rate).
+                        idx.sweep_stale();
+                    }
+                }));
+                if r.is_err() {
+                    tracing::error!(
+                        "KV prune/sweep tick panicked — task continues on next tick"
+                    );
                 }
             }
         });
@@ -1682,14 +1723,9 @@ fn create_policy(
                 Some(rebalance_move_tracker.clone()),
             );
             policy.set_queue_info(flow_controller.clone());
-            // Unified-score weights + hard overload gate. No key_affinity
-            // fallback (the trie self-learns from routed requests); no
-            // KV-sharing groups (PD topology removed).
-            let kvc = &config.router_settings.kvc_aware;
-            policy.set_scoring(
-                kvc.cache_weight,
-                kvc.load_weight,
-                kvc.overload_threshold_pct,
+            // Pure-affinity scoring (hit_ratio); the router-level
+            // rebalance_threshold is the only load-based intervention.
+            policy.set_rebalance_threshold(
                 config.router_settings.rebalance_threshold as u64,
             );
             Arc::new(policy)

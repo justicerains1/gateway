@@ -392,12 +392,11 @@ axum::response::Sse<...>
 load_norm = queue_len / max_inflight (归一化到 [0, 1])
     ↓
 boom-routing::KvcAwarePolicy.select(...)
-    ↓ 加权计算：
-       score = cache_weight * hit_rate
-             - load_weight * load_norm      ← 这一项让负载高的后端得分下降
-             + tier_weight * tier_match
+    ↓ 纯前缀亲和计算：
+       score = hit_ratio                    ← 命中率即得分，无负载项
     ↓
-慢后端 score 低 → 不会被选中
+负载干预仅剩 rebalance：winner 负载超最低候选
+rebalance_threshold 个百分点 → 移交最低负载候选
     ↓
 KeyAffinityPolicy 触发 rebalance：
     RebalanceMoveTracker.record_move(from, to)

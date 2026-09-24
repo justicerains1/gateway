@@ -544,12 +544,9 @@
 │    kv_index.match_prefix(token_ids) →                   │
 │      per-worker 命中比例(0.0 .. 1.0)                   │
 │                                                          │
-│    combined_score[dep] =                                 │
-│        cache_weight * hit_ratio[dep]                     │
-│      + tier_weight   * tier_rank[dep]                    │
-│      + load_weight   * load_norm[dep]                    │
+│    score[dep] = hit_ratio[dep]        （纯前缀亲和，无负载项）│
 │                                                          │
-│    return argmax(combined_score)                         │
+│    return argmax(score)               （并列/全冷 → RR 轮转）│
 │                                                          │
 │  上游数据来源:                                          │
 │    vLLM worker ─ZMQ PUB─▶ boom-kvindex::spawn_kv_        │
@@ -795,7 +792,7 @@
 
 - **L1 的 rebalance 不是手动的**:`KeyAffinityPolicy::select_with_context` 内部检测到 sticky dep 当前的 `InFlightTracker` 计数或 `FlowController.queue_info` 超过内部阈值时,自动迁移;`RebalanceMoveTracker` 只负责"记录"以便 Dashboard 观察,不参与决策。Dashboard `stats/rebalance-moves` API 直接读这个 tracker。
 
-- **L3 的 load·norm 是天然背压**:`KvcAwarePolicy` 的综合分公式里 `load_weight * load_norm[dep]` 这一项是关键。即使某 worker KV 命中率最高,只要它 inflight 满 / queue 堆积,`combined_score` 会被拉低,流量自然流向次优但空闲的 worker。这避免了"所有请求都追逐同一个 KV 命中高的 worker 把它打爆"的反模式。
+- **L3 的负载背压靠 rebalance 而非打分**:`KvcAwarePolicy` 的打分是纯前缀亲和(`score = hit_ratio`),负载不参与评分。防止"所有请求都追逐同一个 KV 命中高的 worker 把它打爆"的机制是容量再平衡:当亲和 winner 的 `load_pct` 比最低负载候选高出 `rebalance_threshold`(router 级配置,与 key_affinity 共用)时,请求移交给最低负载候选——这是该策略唯一的负载干预。
 
 - **ScheduleCtx 是信号总线**:所有策略共享同一份 `ScheduleCtx`,新策略无需自己重新采集 inflight / queue / token_ids。新增背压维度时,只需在 `ScheduleCtx` 加字段 + 在生成 ctx 处采集 + 在策略内消费。
 

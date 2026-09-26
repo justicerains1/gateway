@@ -91,6 +91,16 @@ impl AliasStore {
         self.hidden.clear();
     }
 
+    pub fn replace_from(&self, candidate: &Self) {
+        self.clear();
+        for entry in &candidate.aliases {
+            self.aliases.insert(entry.key().clone(), entry.value().clone());
+        }
+        for alias in candidate.hidden.iter() {
+            self.hidden.insert(alias.key().clone());
+        }
+    }
+
     /// Number of aliases.
     pub fn len(&self) -> usize {
         self.aliases.len()
@@ -152,20 +162,13 @@ impl AliasStore {
     }
 
     /// Load source='db' aliases from DB into this store.
-    pub async fn load_db_only(&self, pool: &PgPool) {
-        let rows: Vec<AliasRow> = match sqlx::query_as::<_, AliasRow>(
+    pub async fn load_db_only_checked(&self, pool: &PgPool) -> Result<(), sqlx::Error> {
+        let rows: Vec<AliasRow> = sqlx::query_as::<_, AliasRow>(
             r#"SELECT alias_name, target_model, hidden, source, updated_at
                FROM boom_model_alias WHERE source = 'db'"#,
         )
         .fetch_all(pool)
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("Failed to load DB-only aliases: {}", e);
-                return;
-            }
-        };
+        .await?;
 
         for row in &rows {
             self.set_alias(
@@ -176,6 +179,13 @@ impl AliasStore {
         }
 
         tracing::info!("Loaded {} DB-only alias(es)", rows.len());
+        Ok(())
+    }
+
+    pub async fn load_db_only(&self, pool: &PgPool) {
+        if let Err(e) = self.load_db_only_checked(pool).await {
+            tracing::error!("Failed to load DB-only aliases: {}", e);
+        }
     }
 
     pub async fn db_only_name_conflicts(

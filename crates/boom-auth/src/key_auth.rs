@@ -80,7 +80,7 @@ impl DbAuthenticator {
         tracing::debug!("Token cache miss, querying DB: {}", &hashed[..8]);
         let result = sqlx::query_as::<_, VerificationToken>(
             r#"SELECT token, key_name, key_alias, key_prefix, tag, spend, expires, models,
-                      aliases, config, user_id, team_id,
+                      aliases, config, user_id, account_id, team_id,
                       max_parallel_requests, metadata, blocked,
                       tpm_limit, rpm_limit, max_budget, budget_duration,
                       budget_reset_at, allowed_cache_controls, allowed_routes,
@@ -109,6 +109,7 @@ impl DbAuthenticator {
     fn token_to_identity(&self, token: VerificationToken) -> AuthIdentity {
         AuthIdentity {
             key_hash: token.token.clone(),
+            account_id: token.account_id,
             key_name: token.key_name.clone(),
             key_alias: token.key_alias,
             user_id: token.user_id,
@@ -179,6 +180,7 @@ impl Authenticator for DbAuthenticator {
             tracing::debug!("Master key authenticated");
             return Ok(AuthIdentity {
                 key_hash: "master".to_string(),
+                account_id: None,
                 key_name: Some("master".to_string()),
                 key_alias: Some("master".to_string()),
                 user_id: None,

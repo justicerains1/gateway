@@ -6,7 +6,7 @@
 
 **中文** | [English](README.en.md)
 
-使用 Rust 构建的生产级 LLM API 网关。统一接入 OpenAI、Anthropic、Gemini、Bedrock、vLLM、Ollama 等 20+ 上游服务商；兼容 litellm 密钥体系，自建限流、套餐、计费、流量治理、Web 管理面板、审计与完整 prompt 落盘。核心差异化能力：**面向 vLLM 前缀缓存优化的智能调度**——会话前缀亲和、密钥亲和、语义路由与反馈式负载均衡。
+使用 Rust 构建的 LLM API 网关。统一接入 OpenAI、Anthropic、Gemini、vLLM、Ollama 等上游服务商；兼容 litellm 密钥体系，自建限流、套餐、计费、流量治理、Web 管理面板、审计与完整 prompt 落盘。核心差异化能力：**面向 vLLM 前缀缓存优化的智能调度**——会话前缀亲和、密钥亲和、语义路由与反馈式负载均衡。
 
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://www.rust-lang.org/)
 [![License: MulanPSL v2](https://img.shields.io/badge/License-MulanPSL%20v2-green.svg)](LICENSE)
@@ -189,7 +189,11 @@ curl http://localhost:4000/v1/chat/completions \
 
 ### 容器部署
 
-容器化部署方案正在完善中，当前请使用源码部署。
+复制上方最小配置为 `config.yaml`，将 `server.host` 设为 `0.0.0.0`。在环境中设置 `MASTER_KEY`、`POSTGRES_PASSWORD`、`DATABASE_URL`（例如 `postgres://boom_gateway:<URL 编码后的密码>@postgres:5432/boom_gateway`）、`BOOM_DASHBOARD_SESSION_SECRET`（至少 32 字节且不同于 master key）及 `BOOM_DASHBOARD_PUBLIC_ORIGIN`（精确的 HTTPS origin，例如 `https://gateway.example.com`），然后运行 `docker compose up -d --build`。`config.yaml` 需允许容器用户 UID 10001 写入，管理面板才能持久化配置修改。Compose 仅绑定本机 `127.0.0.1:4000`，对外服务由 HTTPS 反向代理转发。公开模式会校验控制台写请求的 Origin，并为会话 Cookie 设置 `Secure`。反向代理不在本机时，用 `BOOM_TRUSTED_PROXY_IPS` 指定其容器网络 IP；只有来自该 IP 的登录请求才读取转发的客户端 IP 头。
+
+Bedrock 适配器尚未实现签名和流式调用；`bedrock/*` 配置会在启动或重载时被拒绝。
+
+当前资金账本仅提供数据库事务接口，尚未接到账户、模型调用和支付回调；此版本不能用于充值或对外收费。`BOOM_PUBLIC_MODE` 只启用控制台入口保护，不代表付费平台功能已经完成。
 
 ---
 

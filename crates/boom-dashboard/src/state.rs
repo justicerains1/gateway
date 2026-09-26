@@ -184,6 +184,7 @@ pub struct DashboardState {
     /// alert reconciler. Erased to `Arc<dyn boom_core::AlertApi>` so
     /// boom-dashboard doesn't depend on boom-alert. Read by the status page.
     pub alerts: Arc<dyn boom_core::AlertApi>,
+    pub wallet_pool: Option<PgPool>,
 }
 
 impl DashboardState {
@@ -207,12 +208,14 @@ impl DashboardState {
         stressmon: Arc<dyn boom_core::StressmonApi>,
         trace: Arc<dyn boom_core::TraceApi>,
         alerts: Arc<dyn boom_core::AlertApi>,
+        wallet_pool: Option<PgPool>,
     ) -> Self {
-        // Derive JWT secret from master_key, or use a random fallback.
-        let jwt_secret = master_key
-            .as_deref()
-            .unwrap_or("boom-dashboard-default-secret")
-            .to_string();
+        // Public deployments validate this setting before constructing the router.
+        let jwt_secret = std::env::var("BOOM_DASHBOARD_SESSION_SECRET")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| master_key.clone())
+            .unwrap_or_else(|| "boom-dashboard-default-secret".to_string());
         Self {
             db_pool,
             plan_store,
@@ -235,6 +238,7 @@ impl DashboardState {
             stressmon,
             trace,
             alerts,
+            wallet_pool,
         }
     }
 

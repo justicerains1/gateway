@@ -1,0 +1,6 @@
+.git
+.idea
+target
+config.yaml
+*.bak
+*.log

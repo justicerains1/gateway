@@ -644,6 +644,7 @@ pub struct ModelInfo {
 #[derive(Debug, Clone)]
 pub struct AuthIdentity {
     pub key_hash: String,
+    pub account_id: Option<uuid::Uuid>,
     pub key_name: Option<String>,
     pub key_alias: Option<String>,
     pub user_id: Option<String>,

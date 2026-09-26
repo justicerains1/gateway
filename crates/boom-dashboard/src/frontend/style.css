@@ -1948,14 +1948,37 @@ td.kvc-prefix .kvc-sub { font-size: 11px; color: var(--text3); }
 
 /* ── Responsive ─────────────────────────────────────────── */
 @media (max-width: 768px) {
-  .sidebar { width: 56px; }
-  .sidebar h2, .sidebar .nav-link span, .sidebar-footer { display: none; }
-  .sidebar-top { padding: 12px 8px; justify-content: center; }
-  .lang-toggle { display: none; }
-  .nav-link { justify-content: center; padding: 12px; }
-  .nav-link svg { margin: 0; }
-  .theme-toggle { display: none; }
-  .main-content { padding: 16px; }
+  .layout { flex-direction: column; }
+  .sidebar {
+    width: 100%; flex: none; max-height: 116px;
+    display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: 54px 56px;
+    border-right: 0; border-bottom: 1px solid rgba(255,255,255,.18);
+  }
+  .sidebar-top { grid-column: 1; grid-row: 1; min-width: 0; padding: 8px 12px; border-bottom: 0; }
+  .sidebar-top h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sidebar-footer {
+    grid-column: 2; grid-row: 1; display: flex; flex-wrap: nowrap;
+    padding: 8px 12px 8px 0; border-top: 0;
+  }
+  .sidebar-footer .btn-secondary { flex: none; width: auto; padding: 7px 10px; }
+  .sidebar-version { display: none; }
+  .sidebar nav {
+    grid-column: 1 / -1; grid-row: 2;
+    display: flex; align-items: stretch; min-width: 0;
+    padding: 0 8px; overflow-x: auto; overflow-y: hidden;
+    scrollbar-width: thin;
+  }
+  .nav-link {
+    flex: none; gap: 6px; margin: 0; padding: 8px 10px;
+    border-left: 0; border-bottom: 2px solid transparent;
+    white-space: nowrap;
+  }
+  .nav-link.active { border-left-color: transparent; border-bottom-color: #ffffff; }
+  .lang-toggle, .theme-toggle { display: flex; }
+  .main-content { min-width: 0; min-height: 0; padding: 16px; }
+  .section-header { align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+  .section-header > div { flex-wrap: wrap; }
   table { font-size: 11px; }
   th, td { padding: 8px 10px; }
 }
@@ -2425,6 +2448,11 @@ input[list] {
   border-radius: var(--radius-sm); padding: 12px 20px;
   box-shadow: var(--shadow-md); font-size: 13px; color: var(--text);
   animation: toastIn .25s ease; min-width: 240px;
+}
+.toast--warning { border-color: var(--warn); background: var(--warn-bg); overflow-wrap: anywhere; }
+@media (max-width: 768px) {
+  .toast-container { top: auto; right: 12px; bottom: 12px; left: 12px; }
+  .toast { min-width: 0; max-width: 100%; }
 }
 @keyframes toastIn {
   from { opacity: 0; transform: translateX(20px); }

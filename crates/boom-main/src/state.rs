@@ -34,6 +34,8 @@ pub struct AppState {
     pub config_path: String,
     /// Hot-swappable inner state (config + auth + health only).
     pub inner: Arc<ArcSwap<AppStateInner>>,
+    /// Serializes the short reload commit with request routing decisions.
+    pub routing_gate: Arc<tokio::sync::RwLock<()>>,
     /// DB pool survives reloads (avoids reconnection).
     pub db_pool: Option<PgPool>,
     /// Dashboard-only DB pool with tiny max_connections so heavy stats
@@ -255,7 +257,7 @@ impl AppState {
         ));
 
         // 5. Build from YAML first, then layer DB-only records on top.
-        build_deployments_from_config(&config, &deployment_store);
+        build_deployments_from_config(&config, &deployment_store)?;
         build_aliases_from_config(&config, &alias_store, &deployment_store);
         load_plans_from_config(&plan_store, &config);
         seed_flow_controller_from_config(&config, &flow_controller);
@@ -266,8 +268,17 @@ impl AppState {
             // lock_timeout set on its connection).
             if let Err(e) = boom_dashboard::migrations::run_migrations(pool).await {
                 tracing::error!("Failed to run migrations: {}", e);
+                if std::env::var("BOOM_PUBLIC_MODE").as_deref() == Ok("true") {
+                    return Err(e.into());
+                }
             } else {
                 validate_db_workflow_namespace(pool, &config.workflow_settings).await?;
+            }
+            if let Err(e) = boom_wallet::migrate(pool).await {
+                tracing::error!("Failed to run wallet migration: {}", e);
+                if std::env::var("BOOM_PUBLIC_MODE").as_deref() == Ok("true") {
+                    return Err(e.into());
+                }
             }
 
             // Sync YAML config to DB (upsert source='yaml', handle conflicts).
@@ -276,8 +287,8 @@ impl AppState {
             }
 
             // Load source='db' records on top of YAML-built stores.
-            load_db_only_deployments(pool, &deployment_store, &flow_controller).await;
-            load_db_only_aliases(pool, &alias_store).await;
+            load_db_only_deployments(pool, &deployment_store, &flow_controller).await?;
+            alias_store.load_db_only(pool).await;
             plan_store.load_db_only_plans(pool).await;
 
             // Restore runtime state.
@@ -352,6 +363,7 @@ impl AppState {
         let state = Self {
             config_path,
             inner: Arc::new(ArcSwap::from_pointee(inner)),
+            routing_gate: Arc::new(tokio::sync::RwLock::new(())),
             db_pool,
             dashboard_db_pool,
             log_writer,
@@ -388,11 +400,7 @@ impl AppState {
     /// get a returned `Result` within bounded time, regardless of which step
     /// inside fails, hangs, or panics.
     ///
-    /// On `Err`: the previous `inner` config still routes traffic — only the
-    /// in-memory stores may be partially rebuilt. The atomic swap at the end
-    /// of `reload_inner` is what would have committed the new state; an early
-    /// `Err` skips that swap, so the OLD config object stays live. See
-    /// `reload_inner` doc for the partial-mutation caveat.
+    /// On `Err`, the previous config and routing stores remain active.
     pub async fn reload(&self) -> anyhow::Result<String> {
         use futures::future::FutureExt;
         use std::panic::AssertUnwindSafe;
@@ -426,7 +434,7 @@ impl AppState {
                 );
                 Err(anyhow::anyhow!(
                     "reload aborted: panic captured ({}). \
-                     Previous config still active; stores may be partially rebuilt.",
+                     Previous config remains active.",
                     msg
                 ))
             }
@@ -437,7 +445,7 @@ impl AppState {
                 );
                 Err(anyhow::anyhow!(
                     "reload aborted: timed out after 60s. \
-                     Previous config still active; stores may be partially rebuilt."
+                     Previous config remains active."
                 ))
             }
         }
@@ -451,12 +459,7 @@ impl AppState {
     ///   3. load_db_only_*() → load source='db' records on top
     ///   4. Clean up orphaned assignments
     ///
-    /// Failure window: once step 4's `deployment_store.clear()` runs, the
-    /// stores are mutable targets. Any later failure leaves them in a
-    /// partially-built state while the old `inner` config still routes.
-    /// Wrapping with timeout + catch_unwind (in `reload`) bounds *how long*
-    /// this can take but does NOT roll back partial mutations — that requires
-    /// shadow-build + atomic swap (tracked as TODO).
+    /// Candidate stores are validated before any live store is changed.
     async fn reload_inner(&self) -> anyhow::Result<String> {
         tracing::info!("Hot-reloading config from {}...", self.config_path);
 
@@ -470,40 +473,62 @@ impl AppState {
         let old_db_url = old_guard.config.general_settings.database_url.clone();
         drop(old_guard);
 
-        // 3. Check if DB URL changed.
-        let db_pool = if old_db_url != new_config.general_settings.database_url {
-            tracing::info!("Database URL changed, reconnecting...");
-            match &new_config.general_settings.database_url {
-                Some(url) => Some(
-                    sqlx::postgres::PgPoolOptions::new()
-                        .max_connections(30)
-                        .acquire_timeout(std::time::Duration::from_secs(10))
-                        .idle_timeout(std::time::Duration::from_secs(600))
-                        .max_lifetime(std::time::Duration::from_secs(1800))
-                        .connect(url)
-                        .await?,
-                ),
-                None => None,
-            }
-        } else {
-            self.db_pool.clone()
-        };
+        // Pools and background writers are process-lifetime resources.
+        anyhow::ensure!(
+            old_db_url == new_config.general_settings.database_url,
+            "database_url change requires a process restart"
+        );
+        let db_pool = self.db_pool.clone();
         if let Some(ref pool) = db_pool {
             validate_db_workflow_namespace(pool, &new_config.workflow_settings).await?;
         }
 
         let new_reload_count = old_reload_count + 1;
 
-        // 4. Rebuild stores: YAML first, then DB-only on top.
-        self.deployment_store.clear();
-        build_deployments_from_config(&new_config, &self.deployment_store);
+        // Build into isolated stores. Failed DB reads or workflow validation
+        // must not clear deployments currently serving requests.
+        let candidate_deployments = Arc::new(DeploymentStore::new());
+        let candidate_aliases = Arc::new(AliasStore::new());
+        let candidate_plans = Arc::new(PlanStore::new());
+        let candidate_flow = Arc::new(FlowController::new());
+        build_deployments_from_config(&new_config, &candidate_deployments)?;
+        build_aliases_from_config(&new_config, &candidate_aliases, &candidate_deployments);
+        load_plans_from_config(&candidate_plans, &new_config);
+        seed_flow_controller_from_config(&new_config, &candidate_flow);
 
-        self.alias_store.clear();
-        build_aliases_from_config(&new_config, &self.alias_store, &self.deployment_store);
+        if let Some(ref pool) = db_pool {
+            with_db_timeout(
+                "sync_yaml_to_db",
+                sync_yaml_to_db(pool, &new_config, &candidate_plans),
+            ).await?;
+            with_db_timeout(
+                "load_db_only_deployments",
+                load_db_only_deployments(pool, &candidate_deployments, &candidate_flow),
+            ).await?;
+            with_db_timeout(
+                "load_db_only_aliases",
+                candidate_aliases.load_db_only_checked(pool),
+            ).await?;
+            with_db_timeout(
+                "load_db_only_plans",
+                candidate_plans.load_db_only_plans_checked(pool),
+            ).await?;
+        }
+        self.register_fusion_models_into(
+            &new_config,
+            &candidate_deployments,
+            &candidate_aliases,
+        )?;
+        let new_inner = Self::build_inner(new_config.clone(), &db_pool, old_started_at, new_reload_count)?;
 
-        self.plan_store.clear_plans();
-        load_plans_from_config(&self.plan_store, &new_config);
-        seed_flow_controller_from_config(&new_config, &self.flow_controller);
+        // Readers hold this gate only until they select a provider.
+        let _commit_guard = self.routing_gate.write().await;
+        // No fallible validation remains beyond this point.
+        self.deployment_store.replace_from(&candidate_deployments);
+        self.alias_store.replace_from(&candidate_aliases);
+        self.plan_store.replace_plans_from(&candidate_plans);
+        self.flow_controller.apply_configs_from(&candidate_flow);
+        self.plan_store.cleanup_assignments();
 
         // Rebuild KV-cache subsystem (index + tokenizer pool + subscriber)
         // ONLY when the kvc-relevant config actually changed. The trie is a
@@ -558,41 +583,8 @@ impl AppState {
 
         // Rebuild auto router classifier.
         self.router.set_classifier(build_auto_router(&new_config));
-
-        if let Some(ref pool) = db_pool {
-            // Sync YAML config to DB (upsert source='yaml', handle conflicts).
-            // Errors are non-fatal — log and continue. The follow-up
-            // load_db_only_* steps still need to run against whatever DB
-            // state we have. Timeout bounds DB hangs from blocking reload.
-            if let Err(e) = with_db_timeout(
-                "sync_yaml_to_db",
-                sync_yaml_to_db(pool, &new_config, &self.plan_store),
-            ).await {
-                tracing::error!("Failed to sync YAML to DB: {}", e);
-            }
-
-            // Load source='db' records on top of YAML-built stores. Each step
-            // is independently timeout-bounded; failure aborts the reload
-            // (surfaces via reload's overall Err return), but the previous
-            // inner config still routes.
-            with_db_timeout_void(
-                "load_db_only_deployments",
-                load_db_only_deployments(pool, &self.deployment_store, &self.flow_controller),
-            ).await?;
-            with_db_timeout_void(
-                "load_db_only_aliases",
-                load_db_only_aliases(pool, &self.alias_store),
-            ).await?;
-            with_db_timeout_void(
-                "load_db_only_plans",
-                self.plan_store.load_db_only_plans(pool),
-            ).await?;
-        }
-
-        self.register_fusion_models(&new_config)?;
-
-        // Clean up assignments pointing to plans that no longer exist.
-        self.plan_store.cleanup_assignments();
+        self.inner.store(Arc::new(new_inner));
+        drop(_commit_guard);
 
         // 5. Update prompt log config (hot-reload) + hot-swap OTLP exporter
         //    when its sub-config changes. update_config covers the runtime
@@ -606,7 +598,12 @@ impl AppState {
                 let old_otlp = self.prompt_log_writer.config().otlp;
                 self.prompt_log_writer.update_config(pc.clone());
                 if old_otlp != pc.otlp {
-                    self.prompt_log_writer.replace_otlp(&pc.otlp).await;
+                    if tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        self.prompt_log_writer.replace_otlp(&pc.otlp),
+                    ).await.is_err() {
+                        tracing::warn!("Prompt log OTLP exporter reload timed out");
+                    }
                 }
             }
         } else {
@@ -625,17 +622,13 @@ impl AppState {
             // exporter (or None if disabled). Calling it unconditionally on
             // reload is correct (idempotent for "no change") — the flush on an
             // unchanged config is typically a no-op (queue empty).
-            self.trace
-                .replace_otlp(&new_trace_config.otlp, new_trace_config.enabled)
-                .await;
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.trace.replace_otlp(&new_trace_config.otlp, new_trace_config.enabled),
+            ).await.is_err() {
+                tracing::warn!("Trace OTLP exporter reload timed out");
+            }
         }
-
-        // 6. Build new inner state.
-        let new_inner =
-            Self::build_inner(new_config, &db_pool, old_started_at, new_reload_count)?;
-
-        // 7. Atomic swap.
-        self.inner.store(Arc::new(new_inner));
 
         let model_count = self.deployment_store.len();
         let summary = format!(
@@ -796,6 +789,15 @@ impl AppState {
     }
 
     fn register_fusion_models(&self, config: &Config) -> Result<(), boom_core::GatewayError> {
+        self.register_fusion_models_into(config, &self.deployment_store, &self.alias_store)
+    }
+
+    fn register_fusion_models_into(
+        &self,
+        config: &Config,
+        deployment_store: &Arc<DeploymentStore>,
+        alias_store: &Arc<AliasStore>,
+    ) -> Result<(), boom_core::GatewayError> {
         let runtime = FusionRuntime::new(
             Arc::downgrade(&self.router),
             self.deployment_store.clone(),
@@ -810,8 +812,8 @@ impl AppState {
         );
         register_fusion_providers(
             &config.workflow_settings,
-            &self.deployment_store,
-            &self.alias_store,
+            deployment_store,
+            alias_store,
             runtime,
         )
     }
@@ -1006,27 +1008,14 @@ fn backup_yaml(path: &str) {
 /// `sync_yaml_to_db` call so a slow DB can't hang the entire reload future.
 /// 15s leaves headroom for slow networks without letting a stuck query block
 /// reload indefinitely.
-async fn with_db_timeout<F, T>(op_name: &str, f: F) -> Result<T, anyhow::Error>
+async fn with_db_timeout<F, T, E>(op_name: &str, f: F) -> Result<T, anyhow::Error>
 where
-    F: std::future::Future<Output = Result<T, sqlx::Error>>,
+    F: std::future::Future<Output = Result<T, E>>,
+    E: Into<anyhow::Error>,
 {
     match tokio::time::timeout(std::time::Duration::from_secs(15), f).await {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(anyhow::anyhow!("{}: {}", op_name, e)),
-        Err(_) => Err(anyhow::anyhow!("{} timed out after 15s", op_name)),
-    }
-}
-
-/// Wrap a `()`-returning DB operation with a 15s timeout. Used for the
-/// `load_db_only_*` helpers that swallow errors internally — we can't surface
-/// their internal failures, but we can at least bound their wall time.
-/// Returns `Err` only on timeout.
-async fn with_db_timeout_void<F>(op_name: &str, f: F) -> Result<(), anyhow::Error>
-where
-    F: std::future::Future<Output = ()>,
-{
-    match tokio::time::timeout(std::time::Duration::from_secs(15), f).await {
-        Ok(()) => Ok(()),
+        Ok(Err(e)) => Err(anyhow::anyhow!("{}: {}", op_name, e.into())),
         Err(_) => Err(anyhow::anyhow!("{} timed out after 15s", op_name)),
     }
 }
@@ -1147,14 +1136,8 @@ async fn load_db_only_deployments(
     pool: &PgPool,
     deployment_store: &Arc<DeploymentStore>,
     flow_controller: &Arc<FlowController>,
-) {
-    let rows = match DeploymentStore::load_db_only_rows(pool).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("Failed to load DB-only deployments: {}", e);
-            return;
-        }
-    };
+) -> anyhow::Result<()> {
+    let rows = DeploymentStore::load_db_only_rows(pool).await?;
 
     let mut deployment_count = 0;
     for row in &rows {
@@ -1203,20 +1186,16 @@ async fn load_db_only_deployments(
                 deployment_count += 1;
             }
             Err(e) => {
-                tracing::error!("Failed to create provider for model '{}': {}", row.model_name, e);
+                return Err(anyhow::anyhow!(
+                    "Failed to create provider for DB model '{}': {}",
+                    row.model_name, e
+                ));
             }
         }
     }
 
     // Seed flow control for DB-only deployments using full rows.
-    let fc_rows = match DeploymentStore::list_all_db(pool).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("Failed to load DB deployments for flow control: {}", e);
-            tracing::info!("Loaded {} DB-only deployment(s)", deployment_count);
-            return;
-        }
-    };
+    let fc_rows = DeploymentStore::list_all_db(pool).await?;
     for row in &fc_rows {
         if row.source.as_deref() != Some("db") {
             continue;
@@ -1234,13 +1213,10 @@ async fn load_db_only_deployments(
     }
 
     tracing::info!("Loaded {} DB-only deployment(s)", deployment_count);
+    Ok(())
 }
 
 /// Load source='db' aliases from DB (delegated to AliasStore).
-async fn load_db_only_aliases(pool: &PgPool, alias_store: &Arc<AliasStore>) {
-    alias_store.load_db_only(pool).await;
-}
-
 async fn validate_db_workflow_namespace(
     pool: &PgPool,
     settings: &boom_config::WorkflowSettings,
@@ -1335,7 +1311,7 @@ pub(crate) fn cost_rate_from_model_info(
 }
 
 /// Build deployments directly from YAML config into DeploymentStore.
-fn build_deployments_from_config(config: &Config, deployment_store: &Arc<DeploymentStore>) {
+fn build_deployments_from_config(config: &Config, deployment_store: &Arc<DeploymentStore>) -> anyhow::Result<()> {
     deployment_store.clear();
 
     // Legacy general_settings.public_models: merge into the unified
@@ -1427,11 +1403,10 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
                 }
             }
             Err(e) => {
-                tracing::error!(
+                return Err(anyhow::anyhow!(
                     "Failed to create provider for model '{}': {}",
-                    entry.model_name,
-                    e
-                );
+                    entry.model_name, e
+                ));
             }
         }
     }
@@ -1441,6 +1416,35 @@ fn build_deployments_from_config(config: &Config, deployment_store: &Arc<Deploym
         deployment_store.len(),
         deployment_store.total_deployments(),
     );
+    Ok(())
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_provider_reload_keeps_previous_model() {
+        let path = std::env::temp_dir().join(format!(
+            "boom-reload-{}.yaml",
+            uuid::Uuid::new_v4()
+        ));
+        let valid = "model_list:\n  - model_name: working\n    litellm_params:\n      model: openai/test\n      api_key: sk-test\n";
+        std::fs::write(&path, valid).unwrap();
+        let config_path = path.to_string_lossy().into_owned();
+        let config = boom_config::load_config(&config_path).unwrap();
+        let state = AppState::from_config(config, config_path)
+            .await
+            .unwrap();
+        assert!(state.deployment_store.contains("working"));
+
+        let invalid = valid.replace("openai/test", "unknown-provider/test");
+        std::fs::write(&path, invalid).unwrap();
+        assert!(state.reload().await.is_err());
+        assert!(state.deployment_store.contains("working"));
+        assert_eq!(state.inner.load().health.reload_count, 0);
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 /// Build aliases directly from YAML config into AliasStore.

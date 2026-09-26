@@ -184,6 +184,23 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     // 6. Verification token table (boom-auth).
     tracing::info!("Migration 9/9: boom_verification_token...");
     run_ddl_on_conn(&mut conn, verification_token_ddl()).await?;
+    run_ddl_on_conn(&mut conn, r#"ALTER TABLE "boom_verification_token" ADD COLUMN IF NOT EXISTS account_id UUID"#).await?;
+    run_ddl_on_conn(&mut conn, r#"
+CREATE TABLE IF NOT EXISTS boom_account (
+    id UUID PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    blocked BOOLEAN NOT NULL DEFAULT false
+);
+CREATE TABLE IF NOT EXISTS boom_invitation (
+    code TEXT PRIMARY KEY,
+    max_uses INTEGER NOT NULL DEFAULT 1 CHECK (max_uses > 0),
+    used_count INTEGER NOT NULL DEFAULT 0 CHECK (used_count >= 0),
+    expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"#).await?;
     // Idempotent ALTER: add key_prefix column for prefixed-key feature
     // (no-op if already present). New tables created above already include it.
     let _ = sqlx::query(
@@ -232,6 +249,7 @@ CREATE TABLE IF NOT EXISTS "boom_verification_token" (
     key_prefix TEXT,
     tag TEXT,
     user_id TEXT,
+    account_id UUID,
     team_id TEXT,
     models TEXT[] DEFAULT '{}',
     aliases JSONB,

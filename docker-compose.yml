@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: boom_gateway
+      POSTGRES_USER: boom_gateway
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U boom_gateway -d boom_gateway"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+  gateway:
+    build: .
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - ./config.yaml:/home/gateway/config.yaml
+    environment:
+      MASTER_KEY: ${MASTER_KEY:?set MASTER_KEY}
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL with a URL-encoded password}
+      BOOM_PUBLIC_MODE: "true"
+      BOOM_DASHBOARD_SESSION_SECRET: ${BOOM_DASHBOARD_SESSION_SECRET:?set BOOM_DASHBOARD_SESSION_SECRET}
+      BOOM_DASHBOARD_PUBLIC_ORIGIN: ${BOOM_DASHBOARD_PUBLIC_ORIGIN:?set BOOM_DASHBOARD_PUBLIC_ORIGIN}
+      BOOM_TRUSTED_PROXY_IPS: ${BOOM_TRUSTED_PROXY_IPS:-127.0.0.1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  postgres_data:

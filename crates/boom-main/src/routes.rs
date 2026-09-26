@@ -26,6 +26,7 @@ use futures::StreamExt;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
+use rust_decimal::prelude::ToPrimitive;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -353,6 +354,61 @@ impl<S: futures::Stream + Unpin> futures::Stream for InFlightStream<S> {
 
 type UsageTracker = std::sync::Arc<std::sync::Mutex<UsageTrackerState>>;
 
+struct WalletCharge {
+    pool: sqlx::PgPool,
+    request_id: String,
+    reserved_fen: i64,
+    settled: bool,
+}
+
+impl WalletCharge {
+    async fn reserve(
+        pool: sqlx::PgPool,
+        account_id: uuid::Uuid,
+        request_id: String,
+        amount_fen: i64,
+    ) -> Result<Self, GatewayError> {
+        boom_wallet::reserve(&pool, account_id, amount_fen, &request_id)
+            .await
+            .map_err(|e| GatewayError::RateLimitExceeded {
+                retry_after_secs: None,
+                message: format!("Wallet balance unavailable: {e}"),
+                limit_type: "wallet_balance",
+                scope: Some("account"),
+                scope_id: Some(account_id.to_string()),
+                plan_name: None,
+            })?;
+        Ok(Self { pool, request_id, reserved_fen: amount_fen, settled: false })
+    }
+
+    async fn settle(&mut self, actual_fen: i64) {
+        let actual_fen = actual_fen.max(0).min(self.reserved_fen);
+        let _ = boom_wallet::settle(&self.pool, &self.request_id, actual_fen).await;
+        self.settled = true;
+    }
+}
+
+impl Drop for WalletCharge {
+    fn drop(&mut self) {
+        if !self.settled {
+            let pool = self.pool.clone();
+            let request_id = self.request_id.clone();
+            tokio::spawn(async move { let _ = boom_wallet::cancel(&pool, &request_id).await; });
+        }
+    }
+}
+
+fn usd_to_fen(usd: rust_decimal::Decimal) -> i64 {
+    let rate = std::env::var("BOOM_USD_CNY_RATE").ok().and_then(|v| v.parse::<rust_decimal::Decimal>().ok()).unwrap_or(rust_decimal::Decimal::ZERO);
+    (usd * rate * rust_decimal::Decimal::from(100)).round().to_i64().unwrap_or(i64::MAX)
+}
+
+fn wallet_estimate_fen(state: &AppState, model: &str, input_chars: usize, max_output: u32) -> i64 {
+    let rate = state.deployment_store.get_cost_rate(model);
+    let input_tokens = (input_chars as u64).saturating_add(3) / 4;
+    usd_to_fen(rate.compute_cost(input_tokens, 0, max_output as u64))
+}
+
 /// Accumulated usage from the upstream stream, read by LoggedStream on drop.
 #[derive(Default, Clone)]
 struct UsageTrackerState {
@@ -387,6 +443,7 @@ struct LoggedStream<S> {
     /// Moved into the stream wrapper on the streaming path so the span's
     /// end_time is the actual stream-end time (not handler-return time).
     trace_guard: Option<boom_trace::TraceGuard>,
+    wallet_charge: Option<WalletCharge>,
 }
 
 impl<S> LoggedStream<S> {
@@ -409,6 +466,7 @@ impl<S> LoggedStream<S> {
             plan_charge: None,
             provider_billing: None,
             trace_guard: None,
+            wallet_charge: None,
         }
     }
 
@@ -431,6 +489,11 @@ impl<S> LoggedStream<S> {
     /// handler return — which is before the stream is actually consumed).
     fn with_trace_guard(mut self, guard: boom_trace::TraceGuard) -> Self {
         self.trace_guard = Some(guard);
+        self
+    }
+
+    fn with_wallet_charge(mut self, charge: WalletCharge) -> Self {
+        self.wallet_charge = Some(charge);
         self
     }
 }
@@ -480,6 +543,10 @@ impl<S> Drop for LoggedStream<S> {
                 output_tokens.unwrap_or(0).max(0) as u64,
                 actual_cost,
             );
+        }
+        if let Some(mut wallet) = self.wallet_charge.take() {
+            let actual = self.provider_billing.as_ref().and_then(ProviderBilling::actual_cost).map(|c| usd_to_fen(c.total())).unwrap_or(0);
+            tokio::spawn(async move { wallet.settle(actual).await; });
         }
     }
 }
@@ -555,6 +622,7 @@ async fn chat_completions_inner(
     let start = Instant::now();
     let request_id = new_request_id();
     let client_ip = extract_client_ip(headers, remote_addr);
+    let routing_guard = state.routing_gate.read().await;
     let inner = state.inner.load();
     // pre_auth hook may have decided to rewrite the request's model (along
     // with the key). Apply before any downstream consumer — check_model_access
@@ -726,6 +794,11 @@ async fn chat_completions_inner(
         }).sum(),
         boom_core::types::MessageContent::Null => 0,
     }).sum();
+    let mut wallet_charge = if let (Some(account_id), Some(pool)) = (identity.account_id, state.db_pool.clone()) {
+        let reserve = wallet_estimate_fen(&state, &resolved_model, input_chars, req.max_completion_tokens.or(req.max_tokens).unwrap_or(1024));
+        if reserve <= 0 { return Err(GatewayErrorReply(GatewayError::ProviderError("Paid account requires a configured model price and BOOM_USD_CNY_RATE".to_string()), false)); }
+        Some(WalletCharge::reserve(pool, account_id, request_id.clone(), reserve).await.map_err(|e| GatewayErrorReply(e, is_stream))?)
+    } else { None };
     log_request_summary(
         &request_id, identity, &model, input_chars, is_stream,
         api_path, &plan_charge,
@@ -765,6 +838,7 @@ async fn chat_completions_inner(
         }
     };
 
+    drop(routing_guard);
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let is_vip = is_vip_key(&identity.metadata);
     let fc_guard = if let Some(ref did) = deployment_id {
@@ -958,6 +1032,7 @@ async fn chat_completions_inner(
         }, start, usage, Some(state.agent_stats.clone()))
         .with_plan_charge(plan_charge)
         .with_provider_billing(provider_billing);
+        let logged = match wallet_charge.take() { Some(c) => logged.with_wallet_charge(c), None => logged };
         // Move the trace guard into the stream wrapper so its Drop runs at
         // stream end (the actual response completion time), not at handler
         // return. `.take()` returns None on the non-streaming path; the
@@ -1056,6 +1131,10 @@ async fn chat_completions_inner(
                 return Err(GatewayErrorReply(e, false));
             }
         };
+        if let Some(mut wallet) = wallet_charge.take() {
+            let estimated = provider_billing.actual_cost().map(|c| usd_to_fen(c.total())).unwrap_or_else(|| wallet.reserved_fen);
+            wallet.settle(estimated).await;
+        }
         // Provider accepted the request — commit the plan charge now.
         let _decision = plan_charge.commit();
         // Release concurrency guard now (non-streaming: response is already complete,
@@ -1205,6 +1284,7 @@ pub async fn list_models(
     State(state): State<AppState>,
     auth: RequiredAuth,
 ) -> Result<Json<serde_json::Value>, GatewayErrorReply> {
+    let _routing_guard = state.routing_gate.read().await;
     let identity = auth.identity();
 
     // Collect all visible model names (deployments + non-hidden aliases, excluding "*").
@@ -1257,6 +1337,7 @@ pub async fn get_model(
     auth: RequiredAuth,
     Path(model_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, GatewayErrorReply> {
+    let _routing_guard = state.routing_gate.read().await;
     let identity = auth.identity();
 
     // Collect all visible model names (same logic as list_models).
@@ -2853,6 +2934,7 @@ pub async fn messages(
     let start = Instant::now();
     let request_id = new_request_id();
     let client_ip = extract_client_ip(&headers, Some(remote_addr));
+    let routing_guard = state.routing_gate.read().await;
     let inner = state.inner.load();
 
     // pre_auth hook may have decided to rewrite the request's model (along
@@ -3066,6 +3148,7 @@ pub async fn messages(
         }
     };
 
+    drop(routing_guard);
     // 3.5. Flow control — queue if per-deployment limits exceeded.
     let is_vip = is_vip_key(&identity.metadata);
     let fc_guard = if let Some(ref did) = deployment_id {

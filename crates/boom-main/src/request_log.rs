@@ -417,6 +417,7 @@ pub fn log_auth_error(
     let key_hash = boom_auth::DbAuthenticator::hash_token(raw_key);
     let identity = AuthIdentity {
         key_hash,
+        account_id: None,
         key_name: None,
         key_alias: None,
         user_id: None,

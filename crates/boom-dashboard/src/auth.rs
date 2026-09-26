@@ -1,7 +1,9 @@
 use crate::state::DashboardState;
 use axum::extract::FromRequestParts;
-use axum::http::header::{COOKIE, SET_COOKIE};
+use axum::http::header::{COOKIE, ORIGIN, SET_COOKIE};
 use axum::http::request::Parts;
+use axum::http::{Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use chrono::Utc;
@@ -9,6 +11,47 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
+
+pub async fn verify_origin(
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let public_mode = std::env::var("BOOM_PUBLIC_MODE").as_deref() == Ok("true");
+    let expected = std::env::var("BOOM_DASHBOARD_PUBLIC_ORIGIN").unwrap_or_default();
+    let actual = request.headers().get(ORIGIN).and_then(|value| value.to_str().ok());
+    if !origin_allowed(
+        request.method(), request.uri().path(), actual, public_mode, &expected,
+    ) {
+        return (StatusCode::FORBIDDEN, "Invalid request origin").into_response();
+    }
+    next.run(request).await
+}
+
+fn origin_allowed(method: &Method, path: &str, actual: Option<&str>, public_mode: bool, expected: &str) -> bool {
+    if !public_mode || !path.starts_with("/dashboard/api/") {
+        return true;
+    }
+    if matches!(*method, Method::POST | Method::PUT | Method::PATCH | Method::DELETE) {
+        return actual == Some(expected);
+    }
+    true
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    #[test]
+    fn public_dashboard_writes_require_exact_origin() {
+        let path = "/dashboard/api/admin/keys";
+        let expected = "https://gateway.example.com";
+        assert!(origin_allowed(&Method::POST, path, Some(expected), true, expected));
+        assert!(!origin_allowed(&Method::POST, path, None, true, expected));
+        assert!(!origin_allowed(&Method::PUT, path, Some("https://other.example.com"), true, expected));
+        assert!(origin_allowed(&Method::GET, path, None, true, expected));
+        assert!(origin_allowed(&Method::POST, "/v1/chat/completions", None, true, expected));
+    }
+}
 
 // ── Login rate-limit constants ─────────────────────────────
 
@@ -29,6 +72,7 @@ pub struct DashboardClaims {
     pub role: String,
     /// User's token hash (empty for admin).
     pub key_hash: String,
+    pub account_id: Option<uuid::Uuid>,
     pub exp: i64,
     pub iat: i64,
 }
@@ -137,7 +181,14 @@ impl<S: Send + Sync> FromRequestParts<S> for AdminSession {
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
     pub user_id: String,
+    #[serde(default)]
     pub api_key: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub invite_code: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,6 +201,40 @@ pub struct LoginResponse {
     pub api_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RegisterRequest {
+    pub username: String,
+    pub password: String,
+    pub invite_code: String,
+}
+
+pub async fn register(
+    Extension(state): Extension<std::sync::Arc<DashboardState>>,
+    Json(req): Json<RegisterRequest>,
+) -> Response {
+    let pool = match &state.db_pool { Some(pool) => pool, None => return json_error_response(StatusCode::SERVICE_UNAVAILABLE, "Database not available") };
+    if req.username.len() < 3 || req.username.len() > 64 || req.password.len() < 8 {
+        return json_error_response(StatusCode::BAD_REQUEST, "Username must be 3-64 chars and password at least 8 chars");
+    }
+    let mut tx = match pool.begin().await { Ok(tx) => tx, Err(_) => return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Database error") };
+    let invitation = sqlx::query_as::<_, (i32, i32, Option<chrono::DateTime<Utc>>)>("SELECT max_uses, used_count, expires_at FROM boom_invitation WHERE code = $1 FOR UPDATE")
+        .bind(&req.invite_code).fetch_optional(&mut *tx).await;
+    let Some((max_uses, used_count, expires_at)) = invitation.ok().flatten() else { return json_error_response(StatusCode::BAD_REQUEST, "Invalid invitation code"); };
+    if used_count >= max_uses || expires_at.is_some_and(|at| at < Utc::now()) { return json_error_response(StatusCode::BAD_REQUEST, "Invitation code is exhausted or expired"); }
+    let account_id = uuid::Uuid::new_v4();
+    let salt = uuid::Uuid::new_v4().to_string();
+    let password_hash = hash_password(&salt, &req.password);
+    if sqlx::query("INSERT INTO boom_account(id, username, password_hash) VALUES ($1,$2,$3)").bind(account_id).bind(&req.username).bind(format!("{salt}${password_hash}")).execute(&mut *tx).await.is_err() {
+        return json_error_response(StatusCode::CONFLICT, "Username already exists");
+    }
+    if sqlx::query("UPDATE boom_invitation SET used_count = used_count + 1 WHERE code = $1").bind(&req.invite_code).execute(&mut *tx).await.is_err() { return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to consume invitation"); }
+    let raw_key = format!("sk-{}", uuid::Uuid::new_v4().simple());
+    let token_hash = hash_token(&raw_key);
+    if sqlx::query("INSERT INTO boom_verification_token(token,key_name,key_alias,user_id,account_id,models,spend,blocked) VALUES ($1,$2,$2,$3,$4,'{}',0,false)").bind(&token_hash).bind(&req.username).bind(&req.username).bind(account_id).execute(&mut *tx).await.is_err() { return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to create account key"); }
+    if tx.commit().await.is_err() { return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to create account"); }
+    sign_and_respond(&state, req.username, "user".to_string(), token_hash, Some(raw_key), Some(account_id))
+}
+
 #[derive(Debug, Serialize)]
 pub struct MeResponse {
     pub user_id: String,
@@ -159,7 +244,20 @@ pub struct MeResponse {
 // ── IP Extraction ─────────────────────────────────────────
 
 /// Extract client IP from request headers (reverse-proxy aware).
-fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
+fn extract_client_ip(
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::IpAddr>,
+) -> String {
+    if std::env::var("BOOM_PUBLIC_MODE").as_deref() == Ok("true") {
+        let trusted = std::env::var("BOOM_TRUSTED_PROXY_IPS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| value.trim().parse::<std::net::IpAddr>().ok())
+            .any(|address| Some(address) == peer);
+        if !trusted {
+            return peer.map_or_else(|| "unknown".to_string(), |address| address.to_string());
+        }
+    }
     // Try X-Real-IP first (set by nginx etc.)
     if let Some(val) = headers.get("X-Real-IP").and_then(|v| v.to_str().ok()) {
         let ip = val.trim();
@@ -244,7 +342,11 @@ pub async fn login(
     Extension(state): Extension<std::sync::Arc<DashboardState>>,
     req: axum::http::Request<axum::body::Body>,
 ) -> Response {
-    let client_ip = extract_client_ip(req.headers());
+    let peer = req
+        .extensions()
+        .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip());
+    let client_ip = extract_client_ip(req.headers(), peer);
 
     // 1. Rate-limit check.
     if let Some(remaining) = check_login_lockout(&state, &client_ip) {
@@ -260,7 +362,7 @@ pub async fn login(
     }
 
     // 2. Deserialize body.
-    let LoginRequest { user_id, api_key } = match axum::body::to_bytes(req.into_body(), 4096).await
+    let LoginRequest { user_id, api_key, username, password, invite_code: _ } = match axum::body::to_bytes(req.into_body(), 4096).await
     {
         Ok(bytes) => match serde_json::from_slice::<LoginRequest>(&bytes) {
             Ok(req) => req,
@@ -281,7 +383,7 @@ pub async fn login(
         }
     };
 
-    tracing::info!(ip = %client_ip, user_id = %user_id, "Login attempt");
+    let user_id = username.unwrap_or(user_id);
 
     // 3. Admin login: user_id == "admin" + constant-time comparison with master_key.
     if user_id == "admin" {
@@ -308,10 +410,38 @@ pub async fn login(
 
         clear_login_failures(&state, &client_ip);
         tracing::info!(ip = %client_ip, "Admin login success");
-        return sign_and_respond(&state, "admin".to_string(), "admin".to_string(), String::new(), None);
+        return sign_and_respond(&state, "admin".to_string(), "admin".to_string(), String::new(), None, None);
     }
 
-    // 4. User login: hash the key, then lookup in DB.
+    if !api_key.is_empty() {
+        return login_legacy_key(&state, &client_ip, &api_key);
+    }
+    let Some(password) = password else { return json_error_response(StatusCode::UNAUTHORIZED, "Username and password required"); };
+    let pool = match &state.db_pool { Some(pool) => pool, None => return json_error_response(StatusCode::SERVICE_UNAVAILABLE, "Database not available") };
+    let row = sqlx::query_as::<_, (uuid::Uuid, String, bool)>("SELECT id, password_hash, blocked FROM boom_account WHERE username = $1").bind(&user_id).fetch_optional(pool).await.ok().flatten();
+    let Some((account_id, stored, blocked)) = row else { return json_error_response(StatusCode::UNAUTHORIZED, "Invalid credentials"); };
+    if blocked || !verify_password(&stored, &password) { return json_error_response(StatusCode::UNAUTHORIZED, "Invalid credentials"); }
+    let key_hash: String = sqlx::query_scalar("SELECT token FROM boom_verification_token WHERE account_id = $1 ORDER BY created_at LIMIT 1").bind(account_id).fetch_one(pool).await.unwrap_or_default();
+    clear_login_failures(&state, &client_ip);
+    sign_and_respond(&state, user_id, "user".to_string(), key_hash, None, Some(account_id))
+}
+
+fn login_legacy_key(state: &DashboardState, client_ip: &str, api_key: &str) -> Response {
+    let _ = (state, client_ip, api_key);
+    json_error_response(StatusCode::UNAUTHORIZED, "API key login is available through the LLM API; use username and password for the dashboard")
+}
+
+fn hash_password(salt: &str, password: &str) -> String {
+    let mut hasher = Sha256::new(); hasher.update(salt.as_bytes()); hasher.update(password.as_bytes()); hex::encode(hasher.finalize())
+}
+
+fn verify_password(stored: &str, password: &str) -> bool {
+    let Some((salt, digest)) = stored.split_once('$') else { return false; };
+    constant_time_eq(hash_password(salt, password).as_bytes(), digest.as_bytes())
+}
+
+/* legacy API-key dashboard login removed from public flow */
+/*
     let db_pool = match &state.db_pool {
         Some(pool) => pool,
         None => {
@@ -392,8 +522,8 @@ pub async fn login(
         .or(uid)
         .unwrap_or_else(|| "user".to_string());
 
-    sign_and_respond(&state, display_name, "user".to_string(), token_hash, Some(api_key.clone()))
-}
+    sign_and_respond(&state, display_name, "user".to_string(), token_hash, Some(api_key.clone()), None)
+*/
 
 fn sign_and_respond(
     state: &DashboardState,
@@ -401,12 +531,14 @@ fn sign_and_respond(
     role: String,
     key_hash: String,
     api_key: Option<String>,
+    account_id: Option<uuid::Uuid>,
 ) -> Response {
     let now = Utc::now().timestamp();
     let claims = DashboardClaims {
         sub: user_id.clone(),
         role: role.clone(),
         key_hash,
+        account_id,
         exp: now + SESSION_DURATION_SECS,
         iat: now,
     };
@@ -426,9 +558,14 @@ fn sign_and_respond(
         }
     };
 
+    let secure = if std::env::var("BOOM_PUBLIC_MODE").as_deref() == Ok("true") {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!(
-        "{}={}; HttpOnly; SameSite=Lax; Path=/dashboard; Max-Age={}",
-        SESSION_COOKIE_NAME, token, SESSION_DURATION_SECS
+        "{}={}; HttpOnly; SameSite=Lax; Path=/dashboard; Max-Age={}{}",
+        SESSION_COOKIE_NAME, token, SESSION_DURATION_SECS, secure
     );
 
     let body = Json(LoginResponse { role, user_id, api_key });
@@ -439,9 +576,14 @@ fn sign_and_respond(
 // ── Logout Handler ─────────────────────────────────────────
 
 pub async fn logout() -> Response {
+    let secure = if std::env::var("BOOM_PUBLIC_MODE").as_deref() == Ok("true") {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!(
-        "{}=; HttpOnly; SameSite=Lax; Path=/dashboard; Max-Age=0",
-        SESSION_COOKIE_NAME
+        "{}=; HttpOnly; SameSite=Lax; Path=/dashboard; Max-Age=0{}",
+        SESSION_COOKIE_NAME, secure
     );
     ([(SET_COOKIE, cookie)], axum::http::StatusCode::NO_CONTENT).into_response()
 }

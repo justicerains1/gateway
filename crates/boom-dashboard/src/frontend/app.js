@@ -356,6 +356,13 @@
       e.preventDefault();
       setAdminMode(!isAdminMode);
     });
+    const registerToggle = document.getElementById("register-toggle");
+    if (registerToggle) registerToggle.addEventListener("click", (e) => {
+      e.preventDefault();
+      const invite = document.getElementById("invite_code");
+      invite.classList.toggle("hidden");
+      registerToggle.textContent = invite.classList.contains("hidden") ? "Register with invite" : "Back to login";
+    });
     setAdminMode(false);
     document.getElementById("login-form").addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -366,12 +373,16 @@
       btn.textContent = t("login.logging_in");
       try {
         const userId = document.getElementById("user_id").value.trim();
-        const res = await fetch(API + "/auth/login", {
+        const register = !document.getElementById("invite_code").classList.contains("hidden");
+      const res = await fetch(API + (register ? "/auth/register" : "/auth/login"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             user_id: userId || "",
             api_key: document.getElementById("api_key").value,
+            username: document.getElementById("account_username").value.trim(),
+            password: document.getElementById("account_password").value,
+            invite_code: document.getElementById("invite_code").value.trim(),
           }),
         });
         if (!res.ok) {
@@ -442,9 +453,17 @@
     else if (section === "admin-plans") loadPlans();
     else if (section === "admin-keys") { setupKeysSearch(); loadKeys(); }
     else if (section === "admin-quota") loadQuota();
+    else if (section === "admin-wallet") setupWalletAdmin();
     else if (section === "admin-logs") { setupLogsFilters(); loadLogs(); }
     else if (section === "admin-debug") { setupDebugSubtabs(); setupAnomalyControls(); setupTracePane(); loadAgentStats(); loadRebalanceMoves(); loadKvcDfx(); loadAuditLogStats(); }
     else if (section === "admin-config") loadConfigPage();
+  }
+
+  function setupWalletAdmin() {
+    const invite = document.getElementById("btn-create-invitation");
+    if (invite && !invite.dataset.bound) { invite.dataset.bound="1"; invite.onclick=async()=>{ try { await api("/admin/invitations", { method:"POST", body: JSON.stringify({ code:document.getElementById("wallet-invite-code").value.trim(), max_uses:Number(document.getElementById("wallet-invite-uses").value) }) }); showToast("Invitation created"); } catch(e) { showToast(e.message,5000,"warning"); } }; }
+    const credit = document.getElementById("btn-credit-account");
+    if (credit && !credit.dataset.bound) { credit.dataset.bound="1"; credit.onclick=async()=>{ try { const id=document.getElementById("wallet-account-id").value.trim(); const amount=Number(document.getElementById("wallet-credit-amount").value); const b=await api("/admin/accounts/"+encodeURIComponent(id)+"/credit", { method:"POST", body:JSON.stringify({amount_fen:amount}) }); showToast("Balance: ¥"+(Number(b.available_fen||0)/100).toFixed(2)); } catch(e) { showToast(e.message,5000,"warning"); } }; }
   }
 
   function sectionFromHash(hash) {
@@ -2736,6 +2755,7 @@
 
   window._loadUserLogsPage = (p) => loadUserLogs(p);
   async function loadUserData() {
+    loadWalletBalance();
     // Each panel is fetched independently so a single failing endpoint
     // (e.g. /user/usage throwing on a stale limiter state) doesn't strand
     // the other two panels in their initial "Loading..." state.
@@ -2766,6 +2786,15 @@
       const tEl = document.getElementById("token-info");
       if (tEl) tEl.innerHTML = '<p class="error">' + esc(String(err)) + '</p>';
     }
+  }
+
+  async function loadWalletBalance() {
+    const el = document.getElementById("wallet-info");
+    if (!el) return;
+    try {
+      const b = await api("/user/balance");
+      el.innerHTML = '<div class="wallet-balance"><strong>¥' + (Number(b.available_fen || 0) / 100).toFixed(2) + '</strong><span>Reserved ¥' + (Number(b.reserved_fen || 0) / 100).toFixed(2) + '</span></div>';
+    } catch (e) { el.innerHTML = '<p class="error">' + esc(e.message) + '</p>'; }
   }
 
   function renderPlan(plan) {

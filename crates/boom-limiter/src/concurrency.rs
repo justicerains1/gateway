@@ -657,6 +657,15 @@ impl PlanStore {
         *team_guard = None;
     }
 
+    pub fn replace_plans_from(&self, candidate: &Self) {
+        self.clear_plans();
+        for plan in candidate.list_plans() {
+            self.upsert_plan(plan);
+        }
+        self.set_default_plan(candidate.get_default_plan_name());
+        self.set_default_team_plan(candidate.get_default_team_plan_name());
+    }
+
     /// Remove assignments pointing to plans that no longer exist.
     /// Call after reloading plans to clean up orphaned entries. Explicit
     /// "no plan" assignments (Some(None)) are preserved — the user opted out
@@ -804,8 +813,8 @@ impl PlanStore {
     }
 
     /// Load source='db' plans from DB into memory.
-    pub async fn load_db_only_plans(&self, pool: &sqlx::PgPool) {
-        let rows: Vec<PlanRow> = match sqlx::query_as::<_, PlanRow>(
+    pub async fn load_db_only_plans_checked(&self, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+        let rows: Vec<PlanRow> = sqlx::query_as::<_, PlanRow>(
             r#"SELECT name, type, member_plan,
                       concurrency_limit, rpm_limit, tpm_limit,
                       window_limits, total_token_limit, total_cost_limit_micros,
@@ -813,14 +822,7 @@ impl PlanStore {
                FROM boom_rate_limit_plan WHERE source = 'db'"#,
         )
         .fetch_all(pool)
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("Failed to load DB-only plans: {}", e);
-                return;
-            }
-        };
+        .await?;
 
         for row in &rows {
             let plan = row_to_plan(row);
@@ -828,6 +830,13 @@ impl PlanStore {
         }
 
         tracing::info!("Loaded {} DB-only plan(s)", rows.len());
+        Ok(())
+    }
+
+    pub async fn load_db_only_plans(&self, pool: &sqlx::PgPool) {
+        if let Err(e) = self.load_db_only_plans_checked(pool).await {
+            tracing::error!("Failed to load DB-only plans: {}", e);
+        }
     }
 
     /// Restore key→plan assignments from DB.

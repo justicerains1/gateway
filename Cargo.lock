@@ -379,6 +379,7 @@ dependencies = [
  "boom-limiter",
  "boom-promptlog",
  "boom-routing",
+ "boom-wallet",
  "chrono",
  "csv",
  "dashmap",
@@ -487,6 +488,7 @@ dependencies = [
  "boom-routing",
  "boom-stressmon",
  "boom-trace",
+ "boom-wallet",
  "chrono",
  "clap",
  "dashmap",
@@ -611,6 +613,16 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "boom-wallet"
+version = "0.1.0"
+dependencies = [
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

@@ -550,6 +550,26 @@ impl DeploymentStore {
         self.model_visibility.clear();
     }
 
+    /// Commit a validated reload candidate without rebuilding providers again.
+    pub fn replace_from(&self, candidate: &Self) {
+        self.clear();
+        for entry in &candidate.deployments {
+            self.deployments.insert(entry.key().clone(), entry.value().clone());
+        }
+        for entry in &candidate.quota_ratios {
+            self.quota_ratios.insert(entry.key().clone(), *entry.value());
+        }
+        for entry in &candidate.cost_rates {
+            self.cost_rates.insert(entry.key().clone(), entry.value().clone());
+        }
+        for entry in &candidate.exclusive_providers {
+            self.exclusive_providers.insert(entry.key().clone(), entry.value().clone());
+        }
+        for entry in &candidate.model_visibility {
+            self.model_visibility.insert(entry.key().clone(), entry.value().clone());
+        }
+    }
+
     /// Set the quota count ratio for a model.
     pub fn set_quota_ratio(&self, model_name: &str, ratio: u64) {
         self.quota_ratios.insert(model_name.to_string(), ratio);

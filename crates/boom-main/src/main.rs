@@ -24,6 +24,7 @@ use tower_http::cors::CorsLayer;
 // decay (dirty_decay_ms, default 10s) actively returns freed pages, making
 // RSS track live memory again. Background threads keep decay/purge off the
 // request path.
+#[cfg(unix)]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -77,6 +78,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main(args: Args, config: boom_config::Config) -> anyhow::Result<()> {
+    validate_public_mode(&config)?;
     // CLI overrides.
     let host = args.host.unwrap_or(config.server.host.clone());
     let port = args.port.unwrap_or(config.server.port);
@@ -185,7 +187,8 @@ fn build_router(state: AppState) -> Router {
         // Alias routes (without /v1 prefix — OpenAI client compatibility)
         .route("/chat/completions", post(routes::chat_completions))
         .route("/completions", post(routes::completions))
-        .layer(axum::middleware::from_fn(extractor::buffer_request_body));
+        .layer(axum::middleware::from_fn(extractor::buffer_request_body))
+        .layer(CorsLayer::permissive());
 
     let api_routes = Router::new()
         .route("/v1/models", get(routes::list_models))
@@ -196,7 +199,8 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/embeddings", post(routes::embeddings))
         .route("/v1/audio/speech", post(routes::audio_speech))
         .route("/v1/audio/transcriptions", post(routes::audio_transcriptions))
-        .route("/v1/moderations", post(routes::moderations));
+        .route("/v1/moderations", post(routes::moderations))
+        .layer(CorsLayer::permissive());
 
     // Health check routes (no auth required).
     let health_routes = Router::new()
@@ -258,6 +262,7 @@ fn build_router(state: AppState) -> Router {
         state.stressmon.clone(),
         state.trace.clone() as Arc<dyn boom_core::TraceApi>,
         state.alerts.clone() as Arc<dyn boom_core::AlertApi>,
+        state.db_pool.clone(),
     );
     let dashboard_router = boom_dashboard::build_router(dashboard_state);
 
@@ -270,7 +275,6 @@ fn build_router(state: AppState) -> Router {
         .merge(admin_routes)
         .merge(dashboard_router)
         .with_state(state)
-        .layer(CorsLayer::permissive())
         .layer(axum::middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             let count = request_count.clone();
             async move {
@@ -286,6 +290,28 @@ fn build_router(state: AppState) -> Router {
         }))
 }
 
+fn validate_public_mode(config: &boom_config::Config) -> anyhow::Result<()> {
+    if std::env::var("BOOM_PUBLIC_MODE").as_deref() != Ok("true") {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        config.general_settings.database_url.is_some(),
+        "BOOM_PUBLIC_MODE requires a PostgreSQL database"
+    );
+    let secret = std::env::var("BOOM_DASHBOARD_SESSION_SECRET")?;
+    anyhow::ensure!(
+        secret.len() >= 32 && config.general_settings.master_key.as_deref() != Some(secret.as_str()),
+        "BOOM_DASHBOARD_SESSION_SECRET must be at least 32 bytes and distinct from master_key"
+    );
+    let origin = std::env::var("BOOM_DASHBOARD_PUBLIC_ORIGIN")?;
+    let parsed = reqwest::Url::parse(&origin)?;
+    anyhow::ensure!(
+        parsed.scheme() == "https" && parsed.origin().ascii_serialization() == origin,
+        "BOOM_DASHBOARD_PUBLIC_ORIGIN must be an exact HTTPS origin without a path"
+    );
+    Ok(())
+}
+
 /// Listen for SIGHUP and trigger hot-reload.
 ///
 /// A single-slot `Mutex` serializes concurrent SIGHUPs: rapid `kill -HUP`
@@ -293,9 +319,10 @@ fn build_router(state: AppState) -> Router {
 /// other. `try_lock` (not `lock().await`) so the listener itself never
 /// blocks waiting for the previous reload to finish — additional SIGHUPs
 /// during an in-progress reload just get a "skipping" log line.
-fn spawn_sighup_listener(state: AppState, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
+fn spawn_sighup_listener(state: AppState, shutdown: tokio::sync::broadcast::Receiver<()>) {
     #[cfg(unix)]
     {
+        let mut shutdown = shutdown;
         let reload_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
         let state_clone = state.clone();
         tokio::spawn(async move {

@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod handlers_admin;
+pub mod handlers_account;
 pub mod handlers_static;
 pub mod handlers_user;
 pub mod migrations;
@@ -42,6 +43,10 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
         )
         // Auth endpoints.
         .route("/dashboard/api/auth/login", post(auth::login))
+        .route("/dashboard/api/auth/register", post(auth::register))
+        .route("/dashboard/api/user/balance", get(handlers_account::account_balance))
+        .route("/dashboard/api/admin/invitations", post(handlers_account::create_invitation))
+        .route("/dashboard/api/admin/accounts/{account_id}/credit", post(handlers_account::credit_account))
         .route("/dashboard/api/auth/logout", post(auth::logout))
         .route("/dashboard/api/auth/me", get(auth::me))
         // User endpoints.
@@ -318,7 +323,8 @@ pub fn build_router<S: Clone + Send + Sync + 'static>(state: DashboardState) -> 
         // Inject state via Extension layer.
         .layer(axum::Extension(state_arc.clone()))
         // Merge debug-only routes (compiled out unless `debug-tools` feature is on).
-        .merge(debug_router(state_arc));
+        .merge(debug_router(state_arc))
+        .layer(axum::middleware::from_fn(auth::verify_origin));
 
     main_router
 }

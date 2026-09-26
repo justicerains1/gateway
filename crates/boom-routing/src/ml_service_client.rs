@@ -317,7 +317,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = MlServiceClient::new(&server.url(), 500, valid_tiers());
+        let client = MlServiceClient::new(&server.url(), 2000, valid_tiers());
 
         let msgs = make_messages(vec![("user", "hello")]);
         let req = ClassifyRequest {
@@ -456,7 +456,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = MlServiceClient::new(&server.url(), 500, valid_tiers());
+        let client = MlServiceClient::new(&server.url(), 2000, valid_tiers());
 
         let msgs = make_messages(vec![("user", "debug this")]);
         let req = ClassifyRequest {

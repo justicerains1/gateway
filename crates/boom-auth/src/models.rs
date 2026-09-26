@@ -27,6 +27,8 @@ pub struct VerificationToken {
     pub aliases: Option<serde_json::Value>,
     pub config: Option<serde_json::Value>,
     pub user_id: Option<String>,
+    #[sqlx(default)]
+    pub account_id: Option<uuid::Uuid>,
     pub team_id: Option<String>,
     pub max_parallel_requests: Option<i32>,
     pub metadata: Option<serde_json::Value>,

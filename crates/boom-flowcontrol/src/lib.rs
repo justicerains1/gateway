@@ -406,6 +406,19 @@ impl FlowController {
         }
     }
 
+    pub fn apply_configs_from(&self, candidate: &Self) {
+        for slot in candidate.slots.iter() {
+            let inner = slot.inner.lock().unwrap();
+            self.ensure_slot(
+                slot.key(),
+                &FlowControlConfig {
+                    max_inflight: inner.max_inflight,
+                    max_context: inner.max_context,
+                },
+            );
+        }
+    }
+
     pub fn remove_slot(&self, deployment_id: &str) {
         self.slots.remove(deployment_id);
     }

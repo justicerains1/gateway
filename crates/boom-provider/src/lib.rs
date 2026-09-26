@@ -229,21 +229,12 @@ pub fn create_provider(
             client_type_header,
         )
         .with_custom_headers(attached))),
-        "bedrock" => {
-            let region = merged_extra
-                .get("aws_region_name")
-                .cloned()
-                .unwrap_or_else(|| "us-east-1".to_string());
-            Ok(Arc::new(bedrock::BedrockProvider::new(
-                client,
-                &actual_model,
-                &region,
-                deployment_id,
-                client_type_header,
-            )))
-        }
+        "bedrock" => Err(GatewayError::ConfigError(
+            "Bedrock is not implemented; configure an OpenAI-compatible upstream instead"
+                .to_string(),
+        )),
         _ => Err(GatewayError::ConfigError(format!(
-            "Unknown provider: '{}'. Supported: openai, anthropic, azure, gemini, bedrock, hosted_vllm, vllm, ollama, deepseek, groq, etc.",
+            "Unknown provider: '{}'. Supported: openai, anthropic, azure, gemini, hosted_vllm, vllm, ollama, deepseek, groq, etc.",
             provider_type
         ))),
     }
@@ -328,7 +319,7 @@ pub(crate) fn now_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::create_provider;
-    use boom_core::provider::{Provider, ProviderProtocol};
+    use boom_core::provider::ProviderProtocol;
     use std::collections::HashMap;
 
     #[test]
@@ -354,13 +345,19 @@ mod tests {
         ] {
             assert_eq!(create(model).protocol(), ProviderProtocol::OpenAiCompatible);
         }
-        for model in [
-            "anthropic/test-model",
-            "gemini/test-model",
-            "bedrock/test-model",
-        ] {
+        for model in ["anthropic/test-model", "gemini/test-model"] {
             assert_eq!(create(model).protocol(), ProviderProtocol::Native);
         }
+        assert!(create_provider(
+            "bedrock/test-model",
+            Some("test-key".to_string()),
+            None,
+            1,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            false,
+        ).is_err());
     }
 
     #[test]

@@ -121,7 +121,7 @@ impl ClassificationStrategy for TierClassifier {
 
         // Code blocks.
         if has_code_blocks {
-            score += 0.8;
+            score += 1.0;
         }
 
         // Debug/system keywords.
@@ -257,7 +257,7 @@ impl AutoRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boom_core::types::{ContentPart, MessageRole};
+    use boom_core::types::MessageRole;
 
     fn make_messages(texts: Vec<(&str, &str)>) -> Vec<Message> {
         texts
